@@ -97,29 +97,34 @@ async function checkForNewPools(env, fromBlock, toBlock, rpcUrl) {
 
 export default {
   async scheduled(event, env, ctx) {
-    const rpcUrl = env.RPC_URL || RPC_URL;
-    const currentBlock = await getCurrentBlock(rpcUrl);
-    const lastStr = await env.BOT_STATE.get("lastSeenBlock");
-    const lastBlock = lastStr ? parseInt(lastStr, 10) : currentBlock - 1;
+    try {
+      const rpcUrl = env.RPC_URL || RPC_URL;
+      const currentBlock = await getCurrentBlock(rpcUrl);
+      const lastStr = await env.BOT_STATE.get("lastSeenBlock");
+      const lastBlock = lastStr ? parseInt(lastStr, 10) : currentBlock - 1;
 
-    if (currentBlock <= lastBlock) {
-      console.log("No new blocks yet.");
-      return;
+      if (currentBlock <= lastBlock) {
+        console.log("No new blocks yet.");
+        return;
+      }
+
+      const findings = await checkForNewPools(env, lastBlock + 1, currentBlock, rpcUrl);
+
+      console.log(`Checked blocks ${lastBlock + 1} to ${currentBlock}. Found ${findings.length} new pool(s).`);
+      for (const f of findings) {
+        console.log(JSON.stringify(f, (_, v) => (typeof v === "bigint" ? v.toString() : v)));
+      }
+
+      await env.BOT_STATE.put("lastSeenBlock", currentBlock.toString());
+    } catch (error) {
+      console.error("Scheduled scan failed:", error);
     }
-
-    const findings = await checkForNewPools(env, lastBlock + 1, currentBlock, rpcUrl);
-
-    console.log(`Checked blocks ${lastBlock + 1} to ${currentBlock}. Found ${findings.length} new pool(s).`);
-    for (const f of findings) {
-      console.log(JSON.stringify(f, (_, v) => (typeof v === "bigint" ? v.toString() : v)));
-    }
-
-    await env.BOT_STATE.put("lastSeenBlock", currentBlock.toString());
   },
 
   async fetch(request, env, ctx) {
     await this.scheduled(null, env, null);
     const last = await env.BOT_STATE.get("lastSeenBlock");
-    return new Response(`Robinhood Detective is alive. Last checked block: ${last}`);
+    const lastBlock = last && Number.isFinite(Number(last)) ? last : "unavailable";
+    return new Response(`Robinhood Detective is alive. Last checked block: ${lastBlock}`);
   },
 };
