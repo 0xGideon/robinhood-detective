@@ -20,6 +20,8 @@ let subrequestCount = 0;
 // ---- Configurable settings (from the original spec) ----
 const CONFIG = {
   MIN_LIQUIDITY_USD: 25000,
+  TOKEN_COOLDOWN_MINUTES: 30,
+  MAX_ALERTS_PER_HOUR: 5,
   SCORE_WEIGHTS: {
     NEW_POOL: 20,
     STRONG_LIQUIDITY: 20,
@@ -33,7 +35,7 @@ const CONFIG = {
 
 // ---- Event definitions (human-readable — viem computes the correct topic hash for us) ----
 const V2_PAIR_CREATED = parseAbiItem(
-  "event PairCreated(address indexed token0, address indexed token1, address pair, uint256)"
+  "event PairCreated(address indexed token0, address indexed token1, address pair, uint256 allPairsLength)"
 );
 const V3_POOL_CREATED = parseAbiItem(
   "event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool)"
@@ -169,7 +171,7 @@ async function ethCall(to, data, rpcUrl) {
 async function getPoolLiquidity(finding, rpcUrl, env) {
   if (finding.source === "Uniswap V2") {
     const raw = await ethCall(finding.pair, GET_RESERVES_SELECTOR, rpcUrl);
-    if (typeof raw !== "string" || !/^0x[0-9a-f]+$/i.test(raw) || raw.length < 258) {
+    if (typeof raw !== "string" || !/^0x[0-9a-f]+$/i.test(raw) || raw.length < 194) {
       throw new Error("Invalid getReserves response");
     }
 
@@ -250,6 +252,105 @@ function passesFilter(finding, liquidity) {
     };
   }
   return { passes: true, reason: "Meets liquidity threshold" };
+}
+
+function getNonWethTokenAddress(finding) {
+  const token0 = (finding.token0 || finding.currency0 || "").toLowerCase();
+  const token1 = (finding.token1 || finding.currency1 || "").toLowerCase();
+  const weth = WETH_ADDRESS.toLowerCase();
+  if (token0 && token0 !== weth) return token0;
+  if (token1 && token1 !== weth) return token1;
+  return token0 || token1 || "unknown";
+}
+
+async function isDuplicate(env, finding) {
+  return (await env.BOT_STATE.get(`alerted:${finding.txHash}`)) !== null;
+}
+
+async function markAlerted(env, finding) {
+  await env.BOT_STATE.put(`alerted:${finding.txHash}`, "1", { expirationTtl: 24 * 60 * 60 });
+}
+
+async function isOnCooldown(env, tokenAddress) {
+  return (await env.BOT_STATE.get(`cooldown:${tokenAddress}`)) !== null;
+}
+
+async function startCooldown(env, tokenAddress) {
+  await env.BOT_STATE.put(`cooldown:${tokenAddress}`, "1", {
+    expirationTtl: CONFIG.TOKEN_COOLDOWN_MINUTES * 60,
+  });
+}
+
+async function isUnderHourlyCap(env) {
+  const countStr = await env.BOT_STATE.get("hourlyAlertCount");
+  const count = countStr ? Number.parseInt(countStr, 10) : 0;
+  return Number.isSafeInteger(count) && count < CONFIG.MAX_ALERTS_PER_HOUR;
+}
+
+async function incrementHourlyCap(env) {
+  const countStr = await env.BOT_STATE.get("hourlyAlertCount");
+  const count = countStr ? Number.parseInt(countStr, 10) : 0;
+  const nextCount = Number.isSafeInteger(count) && count >= 0 ? count + 1 : 1;
+  await env.BOT_STATE.put("hourlyAlertCount", nextCount.toString(), { expirationTtl: 60 * 60 });
+}
+
+function formatAlertMessage(finding) {
+  const tokenAddress = getNonWethTokenAddress(finding);
+  const liquidity = finding.liquidity;
+  const liquidityLine =
+    liquidity.pairedWithWeth === true && liquidity.usd !== null
+      ? `Liquidity: $${liquidity.usd.toLocaleString(undefined, { maximumFractionDigits: 0 })}`
+      : liquidity.pairedWithWeth === true
+      ? `Liquidity: ${liquidity.wethAmount.toFixed(3)} WETH (USD price unavailable)`
+      : liquidity.pairedWithWeth === false
+      ? "Liquidity: non-WETH pair - token amounts only"
+      : `Liquidity: N/A (${liquidity.note})`;
+
+  return [
+    "NEW ROBINHOOD ACTIVITY",
+    "",
+    `Token: \`${tokenAddress}\``,
+    "Robinhood Chain",
+    `DEX: ${finding.source}`,
+    liquidityLine,
+    "",
+    `Signal: ${finding.signal.score}/${finding.signal.maxPossibleRightNow}`,
+    `Why it triggered: ${finding.signal.reasons.map((reason) => `- ${reason}`).join("\n")}`,
+    "",
+    `Contract: \`${tokenAddress}\``,
+    `Explorer: https://robinhoodchain.blockscout.com/address/${tokenAddress}`,
+    "",
+    "DYOR. Not financial advice. Independent bot, not affiliated with Robinhood.",
+  ].join("\n");
+}
+
+async function sendTelegramMessage(env, text) {
+  const isDryRun = String(env.DRY_RUN || "true").toLowerCase() === "true";
+  if (isDryRun) {
+    console.log("[DRY RUN] Would send Telegram message:\n" + text);
+    return { ok: true, dryRun: true };
+  }
+
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHANNEL_ID) {
+    throw new Error("Telegram secrets are not configured");
+  }
+
+  trackSubrequest();
+  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: env.TELEGRAM_CHANNEL_ID,
+      text,
+      parse_mode: "Markdown",
+    }),
+  });
+  const json = await res.json();
+  if (!res.ok || !json.ok) {
+    throw new Error(`Telegram send failed: ${JSON.stringify(json)}`);
+  }
+  return json;
 }
 
 function parseStoredBlock(value) {
@@ -371,6 +472,31 @@ export default {
         console.log(
           `${status} | ${f.source} ${f.type} | Signal ${f.signal.score}/${f.signal.maxPossibleRightNow} | ${f.filterResult.reason}`
         );
+
+        if (!f.filterResult.passes) continue;
+
+        if (await isDuplicate(env, f)) {
+          console.log(`Skipping duplicate alert for ${f.txHash}`);
+          continue;
+        }
+
+        const tokenAddress = getNonWethTokenAddress(f);
+        if (await isOnCooldown(env, tokenAddress)) {
+          console.log(`Token ${tokenAddress} is on cooldown, skipping`);
+          continue;
+        }
+
+        if (!(await isUnderHourlyCap(env))) {
+          console.log(`Hourly alert cap reached, skipping ${f.txHash}`);
+          continue;
+        }
+
+        const result = await sendTelegramMessage(env, formatAlertMessage(f));
+        if (result.dryRun) continue;
+
+        await markAlerted(env, f);
+        await startCooldown(env, tokenAddress);
+        await incrementHourlyCap(env);
       }
       await env.BOT_STATE.put("lastSeenBlock", scan.lastCompletedBlock.toString());
     } catch (err) {
