@@ -1,0 +1,10 @@
+name = "robinhood-detective"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+[[kv_namespaces]]
+binding = "BOT_STATE"
+id = "a5cd447820754ae3845354059a79fa6a"
+
+[triggers]
+crons = ["*/3 * * * *"]
