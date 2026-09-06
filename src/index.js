@@ -48,48 +48,52 @@ async function getCurrentBlock(rpcUrl) {
   return parseInt(hex, 16);
 }
 
-// Ask for logs matching an event, from a specific contract, in a block range
-async function getLogs(address, event, fromBlock, toBlock, rpcUrl) {
-  const topic = keccak256(toHex(event.signature ?? formatEventSignature(event)));
-  // viem's parseAbiItem gives us what we need to build the topic ourselves:
-  return rpcCall("eth_getLogs", [
-    {
-      address,
-      fromBlock: toHex(fromBlock),
-      toBlock: toHex(toBlock),
-      topics: [topic],
-    },
-  ], rpcUrl);
-}
-
 // Builds "PairCreated(address,address,address,uint256)" from the parsed event
 function formatEventSignature(event) {
   const types = event.inputs.map((i) => i.type).join(",");
   return `${event.name}(${types})`;
 }
 
+// Ask for logs matching ANY of our 3 events, from ANY of our 3 contracts, in one call
+async function getAllPoolLogs(fromBlock, toBlock, rpcUrl) {
+  const v2Topic = keccak256(toHex(formatEventSignature(V2_PAIR_CREATED)));
+  const v3Topic = keccak256(toHex(formatEventSignature(V3_POOL_CREATED)));
+  const v4Topic = keccak256(toHex(formatEventSignature(V4_INITIALIZE)));
+
+  return rpcCall(
+    "eth_getLogs",
+    [
+      {
+        address: [UNISWAP_V2_FACTORY, UNISWAP_V3_FACTORY, UNISWAP_V4_POOL_MANAGER],
+        fromBlock: toHex(fromBlock),
+        toBlock: toHex(toBlock),
+        topics: [[v2Topic, v3Topic, v4Topic]], // OR: match any of these three topics
+      },
+    ],
+    rpcUrl
+  );
+}
+
 async function checkForNewPools(env, fromBlock, toBlock, rpcUrl) {
   const findings = [];
+  const logs = await getAllPoolLogs(fromBlock, toBlock, rpcUrl);
 
-  // V2 new pairs
-  const v2Logs = await getLogs(UNISWAP_V2_FACTORY, V2_PAIR_CREATED, fromBlock, toBlock, rpcUrl);
-  for (const log of v2Logs) {
-    const decoded = decodeEventLog({ abi: [V2_PAIR_CREATED], data: log.data, topics: log.topics });
-    findings.push({ source: "Uniswap V2", type: "NEW_PAIR", ...decoded.args, txHash: log.transactionHash });
-  }
-
-  // V3 new pools
-  const v3Logs = await getLogs(UNISWAP_V3_FACTORY, V3_POOL_CREATED, fromBlock, toBlock, rpcUrl);
-  for (const log of v3Logs) {
-    const decoded = decodeEventLog({ abi: [V3_POOL_CREATED], data: log.data, topics: log.topics });
-    findings.push({ source: "Uniswap V3", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash });
-  }
-
-  // V4 new pools (singleton PoolManager)
-  const v4Logs = await getLogs(UNISWAP_V4_POOL_MANAGER, V4_INITIALIZE, fromBlock, toBlock, rpcUrl);
-  for (const log of v4Logs) {
-    const decoded = decodeEventLog({ abi: [V4_INITIALIZE], data: log.data, topics: log.topics });
-    findings.push({ source: "Uniswap V4", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash });
+  for (const log of logs) {
+    const address = log.address.toLowerCase();
+    try {
+      if (address === UNISWAP_V2_FACTORY.toLowerCase()) {
+        const decoded = decodeEventLog({ abi: [V2_PAIR_CREATED], data: log.data, topics: log.topics });
+        findings.push({ source: "Uniswap V2", type: "NEW_PAIR", ...decoded.args, txHash: log.transactionHash });
+      } else if (address === UNISWAP_V3_FACTORY.toLowerCase()) {
+        const decoded = decodeEventLog({ abi: [V3_POOL_CREATED], data: log.data, topics: log.topics });
+        findings.push({ source: "Uniswap V3", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash });
+      } else if (address === UNISWAP_V4_POOL_MANAGER.toLowerCase()) {
+        const decoded = decodeEventLog({ abi: [V4_INITIALIZE], data: log.data, topics: log.topics });
+        findings.push({ source: "Uniswap V4", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash });
+      }
+    } catch (err) {
+      console.error("Could not decode a log, skipping it:", err.message);
+    }
   }
 
   return findings;
