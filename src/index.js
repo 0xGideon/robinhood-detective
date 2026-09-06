@@ -5,6 +5,7 @@ const RPC_URL = "https://rpc.mainnet.chain.robinhood.com";
 const UNISWAP_V2_FACTORY = "0x8bceAA40B9acdfaEdf85adF4Ff01f5aD6517937f";
 const UNISWAP_V3_FACTORY = "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA";
 const UNISWAP_V4_POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
+const MAX_LOG_BLOCK_RANGE = 2_000;
 
 // ---- Event definitions (human-readable — viem computes the correct topic hash for us) ----
 const V2_PAIR_CREATED = parseAbiItem(
@@ -20,14 +21,24 @@ const V4_INITIALIZE = parseAbiItem(
 // Small helper: call the RPC with any JSON-RPC method
 async function rpcCall(method, params, rpcUrl = RPC_URL) {
   for (let attempt = 0; attempt < 3; attempt++) {
-    const res = await fetch(rpcUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-    });
-    const json = await res.json();
+    let res;
+    let json;
+    try {
+      res = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      });
+      json = await res.json();
+    } catch (err) {
+      if (attempt === 2) throw new Error(`RPC request failed: ${err.message}`);
+      await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
+      continue;
+    }
 
-    if (res.status === 429 || json.error?.code === 429) {
+    const errorMessage = String(json.error?.message || "").toLowerCase();
+    const isRateLimited = res.status === 429 || json.error?.code === 429 || errorMessage.includes("rate limit");
+    if (isRateLimited) {
       if (attempt === 2) {
         throw new Error("RPC rate limit exceeded after 3 attempts.");
       }
@@ -45,7 +56,16 @@ async function rpcCall(method, params, rpcUrl = RPC_URL) {
 
 async function getCurrentBlock(rpcUrl) {
   const hex = await rpcCall("eth_blockNumber", [], rpcUrl);
+  if (typeof hex !== "string" || !/^0x[0-9a-f]+$/i.test(hex)) {
+    throw new Error(`RPC returned an invalid block number: ${String(hex)}`);
+  }
   return parseInt(hex, 16);
+}
+
+function parseStoredBlock(value) {
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
+  const block = Number(value);
+  return Number.isSafeInteger(block) ? block : null;
 }
 
 // Builds "PairCreated(address,address,address,uint256)" from the parsed event
@@ -76,23 +96,26 @@ async function getAllPoolLogs(fromBlock, toBlock, rpcUrl) {
 
 async function checkForNewPools(env, fromBlock, toBlock, rpcUrl) {
   const findings = [];
-  const logs = await getAllPoolLogs(fromBlock, toBlock, rpcUrl);
+  for (let chunkStart = fromBlock; chunkStart <= toBlock; chunkStart += MAX_LOG_BLOCK_RANGE) {
+    const chunkEnd = Math.min(chunkStart + MAX_LOG_BLOCK_RANGE - 1, toBlock);
+    const logs = await getAllPoolLogs(chunkStart, chunkEnd, rpcUrl);
 
-  for (const log of logs) {
-    const address = log.address.toLowerCase();
-    try {
-      if (address === UNISWAP_V2_FACTORY.toLowerCase()) {
-        const decoded = decodeEventLog({ abi: [V2_PAIR_CREATED], data: log.data, topics: log.topics });
-        findings.push({ source: "Uniswap V2", type: "NEW_PAIR", ...decoded.args, txHash: log.transactionHash });
-      } else if (address === UNISWAP_V3_FACTORY.toLowerCase()) {
-        const decoded = decodeEventLog({ abi: [V3_POOL_CREATED], data: log.data, topics: log.topics });
-        findings.push({ source: "Uniswap V3", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash });
-      } else if (address === UNISWAP_V4_POOL_MANAGER.toLowerCase()) {
-        const decoded = decodeEventLog({ abi: [V4_INITIALIZE], data: log.data, topics: log.topics });
-        findings.push({ source: "Uniswap V4", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash });
+    for (const log of logs) {
+      const address = log.address.toLowerCase();
+      try {
+        if (address === UNISWAP_V2_FACTORY.toLowerCase()) {
+          const decoded = decodeEventLog({ abi: [V2_PAIR_CREATED], data: log.data, topics: log.topics });
+          findings.push({ source: "Uniswap V2", type: "NEW_PAIR", ...decoded.args, txHash: log.transactionHash });
+        } else if (address === UNISWAP_V3_FACTORY.toLowerCase()) {
+          const decoded = decodeEventLog({ abi: [V3_POOL_CREATED], data: log.data, topics: log.topics });
+          findings.push({ source: "Uniswap V3", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash });
+        } else if (address === UNISWAP_V4_POOL_MANAGER.toLowerCase()) {
+          const decoded = decodeEventLog({ abi: [V4_INITIALIZE], data: log.data, topics: log.topics });
+          findings.push({ source: "Uniswap V4", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash });
+        }
+      } catch (err) {
+        console.error("Could not decode a log, skipping it:", err.message);
       }
-    } catch (err) {
-      console.error("Could not decode a log, skipping it:", err.message);
     }
   }
 
@@ -112,7 +135,7 @@ export default {
     }
 
     const lastStr = await env.BOT_STATE.get("lastSeenBlock");
-    const lastBlock = lastStr && !isNaN(parseInt(lastStr, 10)) ? parseInt(lastStr, 10) : currentBlock - 1;
+    const lastBlock = parseStoredBlock(lastStr) ?? currentBlock - 1;
 
     if (currentBlock <= lastBlock) {
       console.log("No new blocks yet.");
@@ -138,6 +161,7 @@ export default {
   // every page load, favicon request, or bot crawler burning extra RPC calls.)
   async fetch(request, env, ctx) {
     const last = await env.BOT_STATE.get("lastSeenBlock");
-    return new Response(`Robinhood Detective is alive. Last checked block: ${last ?? "not yet available"}`);
+    const lastBlock = parseStoredBlock(last);
+    return new Response(`Robinhood Detective is alive. Last checked block: ${lastBlock ?? "not yet available"}`);
   },
 };
