@@ -7,12 +7,15 @@ const UNISWAP_V3_FACTORY = "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA";
 const UNISWAP_V4_POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
 const WETH_ADDRESS = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
 const MAX_LOG_BLOCK_RANGE = 2_000;
+const MAX_SUBREQUESTS_PER_RUN = 40;
 const COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd";
 const GET_RESERVES_SELECTOR = "0x0902f1ac";
 const BALANCE_OF_SELECTOR = "0x70a08231";
 
 let cachedEthPrice = null;
 let cachedEthPriceTime = 0;
+let ethPricePromise = null;
+let subrequestCount = 0;
 
 // ---- Configurable settings (from the original spec) ----
 const CONFIG = {
@@ -42,6 +45,7 @@ const V4_INITIALIZE = parseAbiItem(
 // Small helper: call the RPC with any JSON-RPC method
 async function rpcCall(method, params, rpcUrl = RPC_URL) {
   for (let attempt = 0; attempt < 3; attempt++) {
+    trackSubrequest();
     let res;
     let json;
     try {
@@ -75,6 +79,13 @@ async function rpcCall(method, params, rpcUrl = RPC_URL) {
   }
 }
 
+function trackSubrequest() {
+  subrequestCount++;
+  if (subrequestCount >= MAX_SUBREQUESTS_PER_RUN) {
+    throw new Error("SUBREQUEST_BUDGET_REACHED");
+  }
+}
+
 async function getCurrentBlock(rpcUrl) {
   const hex = await rpcCall("eth_blockNumber", [], rpcUrl);
   if (typeof hex !== "string" || !/^0x[0-9a-f]+$/i.test(hex)) {
@@ -83,27 +94,68 @@ async function getCurrentBlock(rpcUrl) {
   return parseInt(hex, 16);
 }
 
-async function getEthUsdPriceOrNull() {
-  const fiveMinutes = 5 * 60 * 1000;
-  if (cachedEthPrice && Date.now() - cachedEthPriceTime < fiveMinutes) {
+async function getEthUsdPriceOrNull(env) {
+  const tenMinutes = 10 * 60 * 1000;
+  if (cachedEthPrice && Date.now() - cachedEthPriceTime < tenMinutes) {
     return cachedEthPrice;
   }
 
-  try {
-    const res = await fetch(COINGECKO_URL);
-    if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
-    const json = await res.json();
-    const price = json?.ethereum?.usd;
-    if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) {
-      throw new Error("Unexpected CoinGecko response shape");
+  if (ethPricePromise) return ethPricePromise;
+
+  ethPricePromise = (async () => {
+    let cachedRaw = null;
+    let cached = null;
+    try {
+      cachedRaw = await env.BOT_STATE.get("ethPriceCache");
+      if (cachedRaw) {
+        cached = JSON.parse(cachedRaw);
+        if (typeof cached.price === "number" && Number.isFinite(cached.price) && cached.price > 0) {
+          if (Date.now() - cached.time < tenMinutes) {
+            cachedEthPrice = cached.price;
+            cachedEthPriceTime = cached.time;
+            return cached.price;
+          }
+        } else {
+          cached = null;
+        }
+      }
+    } catch (err) {
+      console.error("ETH price cache read failed:", err.message);
+      cached = null;
     }
-    cachedEthPrice = price;
-    cachedEthPriceTime = Date.now();
-    return price;
-  } catch (err) {
-    console.error("CoinGecko price fetch failed, continuing without USD conversion:", err.message);
-    return null;
-  }
+
+    try {
+      trackSubrequest();
+      const res = await fetch(COINGECKO_URL, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; RobinhoodDetectiveBot/1.0)",
+          Accept: "application/json",
+        },
+      });
+      if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
+      const json = await res.json();
+      const price = json?.ethereum?.usd;
+      if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) {
+        throw new Error("Unexpected CoinGecko response shape");
+      }
+      const time = Date.now();
+      await env.BOT_STATE.put("ethPriceCache", JSON.stringify({ price, time }));
+      cachedEthPrice = price;
+      cachedEthPriceTime = time;
+      return price;
+    } catch (err) {
+      console.error("CoinGecko price fetch failed, continuing without USD conversion:", err.message);
+      if (cached) {
+        console.log(`Using stale cached ETH price from ${new Date(cached.time).toISOString()}`);
+        return cached.price;
+      }
+      return null;
+    }
+  })();
+
+  const price = await ethPricePromise;
+  if (price === null) ethPricePromise = null;
+  return price;
 }
 
 function encodeAddressParam(address) {
@@ -114,9 +166,7 @@ async function ethCall(to, data, rpcUrl) {
   return rpcCall("eth_call", [{ to, data }, "latest"], rpcUrl);
 }
 
-async function getPoolLiquidity(finding, rpcUrl) {
-  const ethPrice = await getEthUsdPriceOrNull();
-
+async function getPoolLiquidity(finding, rpcUrl, env) {
   if (finding.source === "Uniswap V2") {
     const raw = await ethCall(finding.pair, GET_RESERVES_SELECTOR, rpcUrl);
     if (typeof raw !== "string" || !/^0x[0-9a-f]+$/i.test(raw) || raw.length < 258) {
@@ -132,6 +182,7 @@ async function getPoolLiquidity(finding, rpcUrl) {
       return { pairedWithWeth: false, note: "Non-WETH pair - token amounts only, no USD figure" };
     }
 
+    const ethPrice = await getEthUsdPriceOrNull(env);
     const wethAmount = Number(token0IsWeth ? reserve0 : reserve1) / 1e18;
     return {
       pairedWithWeth: true,
@@ -149,6 +200,7 @@ async function getPoolLiquidity(finding, rpcUrl) {
       return { pairedWithWeth: false, note: "Non-WETH pair - token amounts only, no USD figure" };
     }
 
+    const ethPrice = await getEthUsdPriceOrNull(env);
     const raw = await ethCall(
       WETH_ADDRESS,
       `${BALANCE_OF_SELECTOR}${encodeAddressParam(finding.pool)}`,
@@ -234,49 +286,64 @@ async function getAllPoolLogs(fromBlock, toBlock, rpcUrl) {
 
 async function checkForNewPools(env, fromBlock, toBlock, rpcUrl) {
   const findings = [];
+  let lastCompletedBlock = fromBlock - 1;
+
   for (let chunkStart = fromBlock; chunkStart <= toBlock; chunkStart += MAX_LOG_BLOCK_RANGE) {
     const chunkEnd = Math.min(chunkStart + MAX_LOG_BLOCK_RANGE - 1, toBlock);
-    const logs = await getAllPoolLogs(chunkStart, chunkEnd, rpcUrl);
+    let logs;
+    try {
+      logs = await getAllPoolLogs(chunkStart, chunkEnd, rpcUrl);
 
-    for (const log of logs) {
-      const address = log.address.toLowerCase();
-      let finding = null;
-      try {
-        if (address === UNISWAP_V2_FACTORY.toLowerCase()) {
-          const decoded = decodeEventLog({ abi: [V2_PAIR_CREATED], data: log.data, topics: log.topics });
-          finding = { source: "Uniswap V2", type: "NEW_PAIR", ...decoded.args, txHash: log.transactionHash };
-        } else if (address === UNISWAP_V3_FACTORY.toLowerCase()) {
-          const decoded = decodeEventLog({ abi: [V3_POOL_CREATED], data: log.data, topics: log.topics });
-          finding = { source: "Uniswap V3", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash };
-        } else if (address === UNISWAP_V4_POOL_MANAGER.toLowerCase()) {
-          const decoded = decodeEventLog({ abi: [V4_INITIALIZE], data: log.data, topics: log.topics });
-          finding = { source: "Uniswap V4", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash };
+      for (const log of logs) {
+        const address = log.address.toLowerCase();
+        let finding = null;
+        try {
+          if (address === UNISWAP_V2_FACTORY.toLowerCase()) {
+            const decoded = decodeEventLog({ abi: [V2_PAIR_CREATED], data: log.data, topics: log.topics });
+            finding = { source: "Uniswap V2", type: "NEW_PAIR", ...decoded.args, txHash: log.transactionHash };
+          } else if (address === UNISWAP_V3_FACTORY.toLowerCase()) {
+            const decoded = decodeEventLog({ abi: [V3_POOL_CREATED], data: log.data, topics: log.topics });
+            finding = { source: "Uniswap V3", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash };
+          } else if (address === UNISWAP_V4_POOL_MANAGER.toLowerCase()) {
+            const decoded = decodeEventLog({ abi: [V4_INITIALIZE], data: log.data, topics: log.topics });
+            finding = { source: "Uniswap V4", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash };
+          }
+        } catch (err) {
+          console.error("Could not decode a log, skipping it:", err.message);
+          continue;
         }
-      } catch (err) {
-        console.error("Could not decode a log, skipping it:", err.message);
-        continue;
-      }
-      if (!finding) continue;
+        if (!finding) continue;
 
-      let liquidity;
-      try {
-        liquidity = await getPoolLiquidity(finding, rpcUrl);
-      } catch (err) {
-        console.error("Liquidity read failed for", finding.txHash, err.message);
-        liquidity = { pairedWithWeth: null, usd: null, note: `Liquidity read error: ${err.message}` };
-      }
+        let liquidity;
+        try {
+          liquidity = await getPoolLiquidity(finding, rpcUrl, env);
+        } catch (err) {
+          if (err.message === "SUBREQUEST_BUDGET_REACHED") throw err;
+          console.error("Liquidity read failed for", finding.txHash, err.message);
+          liquidity = { pairedWithWeth: null, usd: null, note: `Liquidity read error: ${err.message}` };
+        }
 
-      const filterResult = passesFilter(finding, liquidity);
-      const signal = computeSignalScore(finding, liquidity);
-      findings.push({ ...finding, liquidity, filterResult, signal });
+        const filterResult = passesFilter(finding, liquidity);
+        const signal = computeSignalScore(finding, liquidity);
+        findings.push({ ...finding, liquidity, filterResult, signal });
+      }
+      lastCompletedBlock = chunkEnd;
+    } catch (err) {
+      if (err.message === "SUBREQUEST_BUDGET_REACHED") {
+        console.log(`Subrequest budget reached at block ${chunkStart}. Will resume from ${lastCompletedBlock + 1} next run.`);
+        break;
+      }
+      throw err;
     }
   }
 
-  return findings;
+  return { findings, lastCompletedBlock };
 }
 
 export default {
   async scheduled(event, env, ctx) {
+    subrequestCount = 0;
+    ethPricePromise = null;
     const rpcUrl = env.RPC_URL || RPC_URL;
 
     let currentBlock;
@@ -296,7 +363,8 @@ export default {
     }
 
     try {
-      const findings = await checkForNewPools(env, lastBlock + 1, currentBlock, rpcUrl);
+      const scan = await checkForNewPools(env, lastBlock + 1, currentBlock, rpcUrl);
+      const findings = scan.findings;
       console.log(`Checked blocks ${lastBlock + 1} to ${currentBlock}. Found ${findings.length} new pool(s).`);
       for (const f of findings) {
         const status = f.filterResult.passes ? "ALERT-WORTHY" : "filtered";
@@ -304,8 +372,7 @@ export default {
           `${status} | ${f.source} ${f.type} | Signal ${f.signal.score}/${f.signal.maxPossibleRightNow} | ${f.filterResult.reason}`
         );
       }
-      // Only save progress if the scan actually succeeded
-      await env.BOT_STATE.put("lastSeenBlock", currentBlock.toString());
+      await env.BOT_STATE.put("lastSeenBlock", scan.lastCompletedBlock.toString());
     } catch (err) {
       console.error("Log scan failed, will retry next run:", err.message);
       // Important: do NOT update lastSeenBlock here — so we retry this same range next time
