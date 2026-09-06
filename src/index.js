@@ -97,34 +97,43 @@ async function checkForNewPools(env, fromBlock, toBlock, rpcUrl) {
 
 export default {
   async scheduled(event, env, ctx) {
+    const rpcUrl = env.RPC_URL || RPC_URL;
+
+    let currentBlock;
     try {
-      const rpcUrl = env.RPC_URL || RPC_URL;
-      const currentBlock = await getCurrentBlock(rpcUrl);
-      const lastStr = await env.BOT_STATE.get("lastSeenBlock");
-      const lastBlock = lastStr ? parseInt(lastStr, 10) : currentBlock - 1;
+      currentBlock = await getCurrentBlock(rpcUrl);
+    } catch (err) {
+      console.error("Could not fetch current block, skipping this run:", err.message);
+      return; // don't touch KV — just wait for the next scheduled run
+    }
 
-      if (currentBlock <= lastBlock) {
-        console.log("No new blocks yet.");
-        return;
-      }
+    const lastStr = await env.BOT_STATE.get("lastSeenBlock");
+    const lastBlock = lastStr && !isNaN(parseInt(lastStr, 10)) ? parseInt(lastStr, 10) : currentBlock - 1;
 
+    if (currentBlock <= lastBlock) {
+      console.log("No new blocks yet.");
+      return;
+    }
+
+    try {
       const findings = await checkForNewPools(env, lastBlock + 1, currentBlock, rpcUrl);
-
       console.log(`Checked blocks ${lastBlock + 1} to ${currentBlock}. Found ${findings.length} new pool(s).`);
       for (const f of findings) {
         console.log(JSON.stringify(f, (_, v) => (typeof v === "bigint" ? v.toString() : v)));
       }
-
+      // Only save progress if the scan actually succeeded
       await env.BOT_STATE.put("lastSeenBlock", currentBlock.toString());
-    } catch (error) {
-      console.error("Scheduled scan failed:", error);
+    } catch (err) {
+      console.error("Log scan failed, will retry next run:", err.message);
+      // Important: do NOT update lastSeenBlock here — so we retry this same range next time
     }
   },
 
+  // Manual visits just report status — they do NOT trigger a real scan.
+  // (The Cron Trigger already runs scans every 3 minutes; we don't want
+  // every page load, favicon request, or bot crawler burning extra RPC calls.)
   async fetch(request, env, ctx) {
-    await this.scheduled(null, env, null);
     const last = await env.BOT_STATE.get("lastSeenBlock");
-    const lastBlock = last && Number.isFinite(Number(last)) ? last : "unavailable";
-    return new Response(`Robinhood Detective is alive. Last checked block: ${lastBlock}`);
+    return new Response(`Robinhood Detective is alive. Last checked block: ${last ?? "not yet available"}`);
   },
 };
