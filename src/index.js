@@ -8,6 +8,7 @@ const UNISWAP_V4_POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
 const WETH_ADDRESS = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
 const MAX_LOG_BLOCK_RANGE = 2_000;
 const MAX_SUBREQUESTS_PER_RUN = 40;
+const RPC_REQUEST_SPACING_MS = 150;
 const COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd";
 const GET_RESERVES_SELECTOR = "0x0902f1ac";
 const BALANCE_OF_SELECTOR = "0x70a08231";
@@ -48,6 +49,7 @@ const V4_INITIALIZE = parseAbiItem(
 async function rpcCall(method, params, rpcUrl = RPC_URL) {
   for (let attempt = 0; attempt < 3; attempt++) {
     trackSubrequest();
+    await new Promise((resolve) => setTimeout(resolve, RPC_REQUEST_SPACING_MS));
     let res;
     let json;
     try {
@@ -69,7 +71,7 @@ async function rpcCall(method, params, rpcUrl = RPC_URL) {
       if (attempt === 2) {
         throw new Error("RPC rate limit exceeded after 3 attempts.");
       }
-      await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
+      await new Promise((resolve) => setTimeout(resolve, 2000 * 2 ** attempt));
       continue;
     }
 
