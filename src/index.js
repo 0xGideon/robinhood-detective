@@ -14,6 +14,20 @@ const BALANCE_OF_SELECTOR = "0x70a08231";
 let cachedEthPrice = null;
 let cachedEthPriceTime = 0;
 
+// ---- Configurable settings (from the original spec) ----
+const CONFIG = {
+  MIN_LIQUIDITY_USD: 25000,
+  SCORE_WEIGHTS: {
+    NEW_POOL: 20,
+    STRONG_LIQUIDITY: 20,
+    VOLUME_ACCELERATION: 15,
+    BUYER_GROWTH: 10,
+    HOLDER_GROWTH: 10,
+    BUY_SELL_IMBALANCE: 10,
+    FOMO_SIGNAL: 5,
+  },
+};
+
 // ---- Event definitions (human-readable — viem computes the correct topic hash for us) ----
 const V2_PAIR_CREATED = parseAbiItem(
   "event PairCreated(address indexed token0, address indexed token1, address pair, uint256)"
@@ -156,6 +170,36 @@ async function getPoolLiquidity(finding, rpcUrl) {
   return { pairedWithWeth: null, note: "N/A - V4 per-pool liquidity math not yet implemented" };
 }
 
+function computeSignalScore(finding, liquidity) {
+  const weights = CONFIG.SCORE_WEIGHTS;
+  let score = weights.NEW_POOL;
+  const reasons = ["New DEX pool"];
+
+  if (liquidity.pairedWithWeth && liquidity.usd !== null && liquidity.usd >= CONFIG.MIN_LIQUIDITY_USD) {
+    score += weights.STRONG_LIQUIDITY;
+    reasons.push("Strong initial liquidity");
+  }
+
+  return {
+    score,
+    maxPossibleRightNow: weights.NEW_POOL + weights.STRONG_LIQUIDITY,
+    reasons,
+  };
+}
+
+function passesFilter(finding, liquidity) {
+  if (liquidity.pairedWithWeth !== true || liquidity.usd === null) {
+    return { passes: false, reason: liquidity.note || "No verifiable USD liquidity yet" };
+  }
+  if (liquidity.usd < CONFIG.MIN_LIQUIDITY_USD) {
+    return {
+      passes: false,
+      reason: `Liquidity $${liquidity.usd.toFixed(0)} below $${CONFIG.MIN_LIQUIDITY_USD} minimum`,
+    };
+  }
+  return { passes: true, reason: "Meets liquidity threshold" };
+}
+
 function parseStoredBlock(value) {
   if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
   const block = Number(value);
@@ -196,20 +240,35 @@ async function checkForNewPools(env, fromBlock, toBlock, rpcUrl) {
 
     for (const log of logs) {
       const address = log.address.toLowerCase();
+      let finding = null;
       try {
         if (address === UNISWAP_V2_FACTORY.toLowerCase()) {
           const decoded = decodeEventLog({ abi: [V2_PAIR_CREATED], data: log.data, topics: log.topics });
-          findings.push({ source: "Uniswap V2", type: "NEW_PAIR", ...decoded.args, txHash: log.transactionHash });
+          finding = { source: "Uniswap V2", type: "NEW_PAIR", ...decoded.args, txHash: log.transactionHash };
         } else if (address === UNISWAP_V3_FACTORY.toLowerCase()) {
           const decoded = decodeEventLog({ abi: [V3_POOL_CREATED], data: log.data, topics: log.topics });
-          findings.push({ source: "Uniswap V3", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash });
+          finding = { source: "Uniswap V3", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash };
         } else if (address === UNISWAP_V4_POOL_MANAGER.toLowerCase()) {
           const decoded = decodeEventLog({ abi: [V4_INITIALIZE], data: log.data, topics: log.topics });
-          findings.push({ source: "Uniswap V4", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash });
+          finding = { source: "Uniswap V4", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash };
         }
       } catch (err) {
         console.error("Could not decode a log, skipping it:", err.message);
+        continue;
       }
+      if (!finding) continue;
+
+      let liquidity;
+      try {
+        liquidity = await getPoolLiquidity(finding, rpcUrl);
+      } catch (err) {
+        console.error("Liquidity read failed for", finding.txHash, err.message);
+        liquidity = { pairedWithWeth: null, usd: null, note: `Liquidity read error: ${err.message}` };
+      }
+
+      const filterResult = passesFilter(finding, liquidity);
+      const signal = computeSignalScore(finding, liquidity);
+      findings.push({ ...finding, liquidity, filterResult, signal });
     }
   }
 
@@ -240,7 +299,10 @@ export default {
       const findings = await checkForNewPools(env, lastBlock + 1, currentBlock, rpcUrl);
       console.log(`Checked blocks ${lastBlock + 1} to ${currentBlock}. Found ${findings.length} new pool(s).`);
       for (const f of findings) {
-        console.log(JSON.stringify(f, (_, v) => (typeof v === "bigint" ? v.toString() : v)));
+        const status = f.filterResult.passes ? "ALERT-WORTHY" : "filtered";
+        console.log(
+          `${status} | ${f.source} ${f.type} | Signal ${f.signal.score}/${f.signal.maxPossibleRightNow} | ${f.filterResult.reason}`
+        );
       }
       // Only save progress if the scan actually succeeded
       await env.BOT_STATE.put("lastSeenBlock", currentBlock.toString());
