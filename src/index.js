@@ -5,7 +5,14 @@ const RPC_URL = "https://rpc.mainnet.chain.robinhood.com";
 const UNISWAP_V2_FACTORY = "0x8bceAA40B9acdfaEdf85adF4Ff01f5aD6517937f";
 const UNISWAP_V3_FACTORY = "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA";
 const UNISWAP_V4_POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
+const WETH_ADDRESS = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
 const MAX_LOG_BLOCK_RANGE = 2_000;
+const COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd";
+const GET_RESERVES_SELECTOR = "0x0902f1ac";
+const BALANCE_OF_SELECTOR = "0x70a08231";
+
+let cachedEthPrice = null;
+let cachedEthPriceTime = 0;
 
 // ---- Event definitions (human-readable — viem computes the correct topic hash for us) ----
 const V2_PAIR_CREATED = parseAbiItem(
@@ -60,6 +67,93 @@ async function getCurrentBlock(rpcUrl) {
     throw new Error(`RPC returned an invalid block number: ${String(hex)}`);
   }
   return parseInt(hex, 16);
+}
+
+async function getEthUsdPriceOrNull() {
+  const fiveMinutes = 5 * 60 * 1000;
+  if (cachedEthPrice && Date.now() - cachedEthPriceTime < fiveMinutes) {
+    return cachedEthPrice;
+  }
+
+  try {
+    const res = await fetch(COINGECKO_URL);
+    if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
+    const json = await res.json();
+    const price = json?.ethereum?.usd;
+    if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) {
+      throw new Error("Unexpected CoinGecko response shape");
+    }
+    cachedEthPrice = price;
+    cachedEthPriceTime = Date.now();
+    return price;
+  } catch (err) {
+    console.error("CoinGecko price fetch failed, continuing without USD conversion:", err.message);
+    return null;
+  }
+}
+
+function encodeAddressParam(address) {
+  return address.toLowerCase().replace("0x", "").padStart(64, "0");
+}
+
+async function ethCall(to, data, rpcUrl) {
+  return rpcCall("eth_call", [{ to, data }, "latest"], rpcUrl);
+}
+
+async function getPoolLiquidity(finding, rpcUrl) {
+  const ethPrice = await getEthUsdPriceOrNull();
+
+  if (finding.source === "Uniswap V2") {
+    const raw = await ethCall(finding.pair, GET_RESERVES_SELECTOR, rpcUrl);
+    if (typeof raw !== "string" || !/^0x[0-9a-f]+$/i.test(raw) || raw.length < 258) {
+      throw new Error("Invalid getReserves response");
+    }
+
+    const reserve0 = BigInt(`0x${raw.slice(2, 66)}`);
+    const reserve1 = BigInt(`0x${raw.slice(66, 130)}`);
+    const token0IsWeth = finding.token0.toLowerCase() === WETH_ADDRESS.toLowerCase();
+    const token1IsWeth = finding.token1.toLowerCase() === WETH_ADDRESS.toLowerCase();
+
+    if (!token0IsWeth && !token1IsWeth) {
+      return { pairedWithWeth: false, note: "Non-WETH pair - token amounts only, no USD figure" };
+    }
+
+    const wethAmount = Number(token0IsWeth ? reserve0 : reserve1) / 1e18;
+    return {
+      pairedWithWeth: true,
+      wethAmount,
+      usd: ethPrice === null ? null : wethAmount * ethPrice,
+      ...(ethPrice === null ? { note: "WETH price unavailable this run" } : {}),
+    };
+  }
+
+  if (finding.source === "Uniswap V3") {
+    const token0IsWeth = finding.token0.toLowerCase() === WETH_ADDRESS.toLowerCase();
+    const token1IsWeth = finding.token1.toLowerCase() === WETH_ADDRESS.toLowerCase();
+
+    if (!token0IsWeth && !token1IsWeth) {
+      return { pairedWithWeth: false, note: "Non-WETH pair - token amounts only, no USD figure" };
+    }
+
+    const raw = await ethCall(
+      WETH_ADDRESS,
+      `${BALANCE_OF_SELECTOR}${encodeAddressParam(finding.pool)}`,
+      rpcUrl
+    );
+    if (typeof raw !== "string" || !/^0x[0-9a-f]+$/i.test(raw)) {
+      throw new Error("Invalid WETH balance response");
+    }
+
+    const wethAmount = Number(BigInt(raw)) / 1e18;
+    return {
+      pairedWithWeth: true,
+      wethAmount,
+      usd: ethPrice === null ? null : wethAmount * ethPrice,
+      ...(ethPrice === null ? { note: "WETH price unavailable this run" } : {}),
+    };
+  }
+
+  return { pairedWithWeth: null, note: "N/A - V4 per-pool liquidity math not yet implemented" };
 }
 
 function parseStoredBlock(value) {
