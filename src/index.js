@@ -2,6 +2,10 @@ import { keccak256, toHex, decodeEventLog, parseAbiItem } from "viem";
 
 // ---- Our verified contract addresses (Robinhood Chain) ----
 const RPC_URL = "https://rpc.mainnet.chain.robinhood.com";
+const RPC_FALLBACK_URLS = [
+  "https://robinhood-rpc.publicnode.com",
+  "https://rpc.ordofi.network",
+];
 const UNISWAP_V2_FACTORY = "0x8bceAA40B9acdfaEdf85adF4Ff01f5aD6517937f";
 const UNISWAP_V3_FACTORY = "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA";
 const UNISWAP_V4_POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
@@ -17,6 +21,7 @@ let cachedEthPrice = null;
 let cachedEthPriceTime = 0;
 let ethPricePromise = null;
 let subrequestCount = 0;
+let preferredRpcUrl = RPC_URL;
 
 // ---- Configurable settings (from the original spec) ----
 const CONFIG = {
@@ -47,40 +52,61 @@ const V4_INITIALIZE = parseAbiItem(
 
 // Small helper: call the RPC with any JSON-RPC method
 async function rpcCall(method, params, rpcUrl = RPC_URL) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    trackSubrequest();
-    await new Promise((resolve) => setTimeout(resolve, RPC_REQUEST_SPACING_MS));
-    let res;
-    let json;
-    try {
-      res = await fetch(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-      });
-      json = await res.json();
-    } catch (err) {
-      if (attempt === 2) throw new Error(`RPC request failed: ${err.message}`);
-      await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
-      continue;
-    }
+  const endpoints = [...new Set([preferredRpcUrl, rpcUrl, ...RPC_FALLBACK_URLS])];
+  let lastError = null;
 
-    const errorMessage = String(json.error?.message || "").toLowerCase();
-    const isRateLimited = res.status === 429 || json.error?.code === 429 || errorMessage.includes("rate limit");
-    if (isRateLimited) {
-      if (attempt === 2) {
-        throw new Error("RPC rate limit exceeded after 3 attempts.");
+  for (const endpoint of endpoints) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      trackSubrequest();
+      await new Promise((resolve) => setTimeout(resolve, RPC_REQUEST_SPACING_MS));
+      let res;
+      let json;
+      try {
+        res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+        });
+        json = await res.json();
+      } catch (err) {
+        lastError = new Error(`RPC request failed: ${err.message}`);
+        if (attempt < 2) {
+          await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
+          continue;
+        }
+        break;
       }
-      await new Promise((resolve) => setTimeout(resolve, 2000 * 2 ** attempt));
-      continue;
+
+      const errorMessage = String(json.error?.message || "").toLowerCase();
+      const isRateLimited =
+        res.status === 429 ||
+        json.error?.code === 429 ||
+        errorMessage.includes("rate limit") ||
+        errorMessage.includes("too many requests");
+      if (isRateLimited) {
+        lastError = new Error("RPC rate limit exceeded after 3 attempts.");
+        if (attempt < 2) {
+          await new Promise((resolve) => setTimeout(resolve, 2000 * 2 ** attempt));
+          continue;
+        }
+        break;
+      }
+
+      if (!res.ok) {
+        lastError = new Error(`RPC HTTP error: ${res.status}`);
+        break;
+      }
+      if (json.error) throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
+      preferredRpcUrl = endpoint;
+      return json.result;
     }
 
-    if (!res.ok) {
-      throw new Error(`RPC HTTP error: ${res.status}`);
+    if (endpoints.length > 1) {
+      console.warn(`RPC endpoint unavailable, trying fallback: ${endpoint}`);
     }
-    if (json.error) throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
-    return json.result;
   }
+
+  throw lastError || new Error("RPC request failed on all configured endpoints");
 }
 
 function trackSubrequest() {
@@ -447,6 +473,7 @@ export default {
   async scheduled(event, env, ctx) {
     subrequestCount = 0;
     ethPricePromise = null;
+    preferredRpcUrl = env.RPC_URL || RPC_URL;
     const rpcUrl = env.RPC_URL || RPC_URL;
 
     let currentBlock;
