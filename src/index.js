@@ -12,6 +12,7 @@ const UNISWAP_V4_POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
 const WETH_ADDRESS = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
 const MAX_LOG_BLOCK_RANGE = 2_000;
 const MAX_SUBREQUESTS_PER_RUN = 40;
+const ALERT_SUBREQUEST_RESERVE = 5;
 const RPC_REQUEST_SPACING_MS = 150;
 const COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd";
 const GET_RESERVES_SELECTOR = "0x0902f1ac";
@@ -21,11 +22,12 @@ let cachedEthPrice = null;
 let cachedEthPriceTime = 0;
 let ethPricePromise = null;
 let subrequestCount = 0;
+let subrequestReserve = 0;
 let preferredRpcUrl = RPC_URL;
 
 // ---- Configurable settings (from the original spec) ----
 const CONFIG = {
-  MIN_LIQUIDITY_USD: 25000,
+  MIN_LIQUIDITY_USD: 1000,
   TOKEN_COOLDOWN_MINUTES: 30,
   MAX_ALERTS_PER_HOUR: 5,
   SCORE_WEIGHTS: {
@@ -110,10 +112,10 @@ async function rpcCall(method, params, rpcUrl = RPC_URL) {
 }
 
 function trackSubrequest() {
-  subrequestCount++;
-  if (subrequestCount >= MAX_SUBREQUESTS_PER_RUN) {
+  if (subrequestCount >= MAX_SUBREQUESTS_PER_RUN - subrequestReserve) {
     throw new Error("SUBREQUEST_BUDGET_REACHED");
   }
+  subrequestCount++;
 }
 
 async function getCurrentBlock(rpcUrl) {
@@ -472,6 +474,7 @@ async function checkForNewPools(env, fromBlock, toBlock, rpcUrl) {
 export default {
   async scheduled(event, env, ctx) {
     subrequestCount = 0;
+    subrequestReserve = 0;
     ethPricePromise = null;
     preferredRpcUrl = env.RPC_URL || RPC_URL;
     const rpcUrl = env.RPC_URL || RPC_URL;
@@ -493,7 +496,13 @@ export default {
     }
 
     try {
-      const scan = await checkForNewPools(env, lastBlock + 1, currentBlock, rpcUrl);
+      subrequestReserve = ALERT_SUBREQUEST_RESERVE;
+      let scan;
+      try {
+        scan = await checkForNewPools(env, lastBlock + 1, currentBlock, rpcUrl);
+      } finally {
+        subrequestReserve = 0;
+      }
       const findings = scan.findings;
       console.log(`Checked blocks ${lastBlock + 1} to ${currentBlock}. Found ${findings.length} new pool(s).`);
       for (const f of findings) {
@@ -520,12 +529,16 @@ export default {
           continue;
         }
 
-        const result = await sendTelegramMessage(env, formatAlertMessage(f));
-        if (result.dryRun) continue;
+        try {
+          const result = await sendTelegramMessage(env, formatAlertMessage(f));
+          if (result.dryRun) continue;
 
-        await markAlerted(env, f);
-        await startCooldown(env, tokenAddress);
-        await incrementHourlyCap(env);
+          await markAlerted(env, f);
+          await startCooldown(env, tokenAddress);
+          await incrementHourlyCap(env);
+        } catch (err) {
+          console.error(`Failed to send alert for ${f.txHash}, will retry next cycle:`, err.message);
+        }
       }
       await env.BOT_STATE.put("lastSeenBlock", scan.lastCompletedBlock.toString());
     } catch (err) {

@@ -8,3 +8,11 @@ id = "a5cd447820754ae3845354059a79fa6a"
 
 [triggers]
 crons = ["*/3 * * * *"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
