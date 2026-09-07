@@ -13,6 +13,8 @@ const WETH_ADDRESS = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
 const MAX_LOG_BLOCK_RANGE = 500;
 const MAX_SUBREQUESTS_PER_RUN = 40;
 const ALERT_SUBREQUEST_RESERVE = 5;
+const MAX_PENDING_POOL_CHECKS_PER_RUN = 8;
+const PENDING_POOL_TTL_SECONDS = 24 * 60 * 60;
 const RPC_REQUEST_SPACING_MS = 150;
 const COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd";
 const GET_RESERVES_SELECTOR = "0x0902f1ac";
@@ -260,12 +262,22 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
     const token1IsWeth = finding.token1.toLowerCase() === WETH_ADDRESS.toLowerCase();
 
     if (!token0IsWeth && !token1IsWeth) {
+      if (reserve0 === 0n && reserve1 === 0n) {
+        return {
+          pairedWithWeth: false,
+          token0Amount: 0,
+          token1Amount: 0,
+          zeroLiquidity: true,
+          note: "Non-WETH pair - zero liquidity",
+        };
+      }
       const decimals0 = await getTokenDecimalsOrDefault(finding.token0, rpcUrl);
       const decimals1 = await getTokenDecimalsOrDefault(finding.token1, rpcUrl);
       return {
         pairedWithWeth: false,
         token0Amount: Number(reserve0) / 10 ** decimals0,
         token1Amount: Number(reserve1) / 10 ** decimals1,
+        zeroLiquidity: reserve0 === 0n && reserve1 === 0n,
         note: "Non-WETH pair - token amounts shown, no USD figure",
       };
     }
@@ -276,6 +288,7 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
       pairedWithWeth: true,
       wethAmount,
       usd: ethPrice === null ? null : wethAmount * ethPrice,
+      zeroLiquidity: (token0IsWeth ? reserve0 : reserve1) === 0n,
       ...(ethPrice === null ? { note: "WETH price unavailable this run" } : {}),
     };
   }
@@ -289,6 +302,15 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
         getTokenBalance(finding.token0, finding.pool, rpcUrl),
         getTokenBalance(finding.token1, finding.pool, rpcUrl),
       ]);
+      if (balance0 === 0n && balance1 === 0n) {
+        return {
+          pairedWithWeth: false,
+          token0Amount: 0,
+          token1Amount: 0,
+          zeroLiquidity: true,
+          note: "Non-WETH pair - zero liquidity",
+        };
+      }
       const [decimals0, decimals1] = await Promise.all([
         getTokenDecimalsOrDefault(finding.token0, rpcUrl),
         getTokenDecimalsOrDefault(finding.token1, rpcUrl),
@@ -297,16 +319,19 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
         pairedWithWeth: false,
         token0Amount: Number(balance0) / 10 ** decimals0,
         token1Amount: Number(balance1) / 10 ** decimals1,
+        zeroLiquidity: balance0 === 0n && balance1 === 0n,
         note: "Non-WETH pair - token amounts shown, no USD figure",
       };
     }
 
+    const wethRaw = await getTokenBalance(WETH_ADDRESS, finding.pool, rpcUrl);
     const ethPrice = await getEthUsdPriceOrNull(env);
-    const wethAmount = Number(await getTokenBalance(WETH_ADDRESS, finding.pool, rpcUrl)) / 1e18;
+    const wethAmount = Number(wethRaw) / 1e18;
     return {
       pairedWithWeth: true,
       wethAmount,
       usd: ethPrice === null ? null : wethAmount * ethPrice,
+      zeroLiquidity: wethRaw === 0n,
       ...(ethPrice === null ? { note: "WETH price unavailable this run" } : {}),
     };
   }
@@ -333,6 +358,7 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
     return {
       pairedWithWeth: token0IsWeth || token1IsWeth,
       usd: token0IsWeth || token1IsWeth ? 0 : null,
+      zeroLiquidity: true,
       note: "V4 pool not yet funded (zero liquidity)",
     };
   }
@@ -348,6 +374,7 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
     return {
       pairedWithWeth: false,
       estimated: true,
+      zeroLiquidity: false,
       token0Amount: Number(virtualReserve0) / 10 ** decimals0,
       token1Amount: Number(virtualReserve1) / 10 ** decimals1,
       note: "Non-WETH V4 pair - estimated token amounts, no USD figure",
@@ -360,6 +387,7 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
   return {
     pairedWithWeth: true,
     estimated: true,
+    zeroLiquidity: false,
     wethAmount,
     usd: ethPrice === null ? null : wethAmount * ethPrice,
     note: ethPrice === null ? "WETH price unavailable this run" : "Estimated from active-tick liquidity (V4)",
@@ -406,11 +434,13 @@ function getNonWethTokenAddress(finding) {
 }
 
 async function isDuplicate(env, finding) {
-  return (await env.BOT_STATE.get(`alerted:${finding.txHash}`)) !== null;
+  return (await env.BOT_STATE.get(`alerted:${finding.alertKind || "THRESHOLD"}:${finding.txHash}`)) !== null;
 }
 
 async function markAlerted(env, finding) {
-  await env.BOT_STATE.put(`alerted:${finding.txHash}`, "1", { expirationTtl: 24 * 60 * 60 });
+  await env.BOT_STATE.put(`alerted:${finding.alertKind || "THRESHOLD"}:${finding.txHash}`, "1", {
+    expirationTtl: 24 * 60 * 60,
+  });
 }
 
 async function isOnCooldown(env, tokenAddress) {
@@ -436,9 +466,78 @@ async function incrementHourlyCap(env) {
   await env.BOT_STATE.put("hourlyAlertCount", nextCount.toString(), { expirationTtl: 60 * 60 });
 }
 
+function getPendingPoolKey(finding) {
+  return `pendingPool:${finding.source}:${finding.txHash}`;
+}
+
+function serializePendingFinding(finding) {
+  return JSON.stringify({
+    source: finding.source,
+    type: finding.type,
+    txHash: finding.txHash,
+    token0: finding.token0,
+    token1: finding.token1,
+    pair: finding.pair,
+    pool: finding.pool,
+    id: finding.id,
+    currency0: finding.currency0,
+    currency1: finding.currency1,
+    sqrtPriceX96: finding.sqrtPriceX96?.toString(),
+  });
+}
+
+async function rememberPendingPool(env, finding) {
+  await env.BOT_STATE.put(getPendingPoolKey(finding), serializePendingFinding(finding), {
+    expirationTtl: PENDING_POOL_TTL_SECONDS,
+  });
+}
+
+async function getPendingPoolFindings(env) {
+  const listed = await env.BOT_STATE.list({ prefix: "pendingPool:", limit: MAX_PENDING_POOL_CHECKS_PER_RUN });
+  const findings = [];
+  for (const key of listed.keys) {
+    const stored = await env.BOT_STATE.get(key.name);
+    if (!stored) continue;
+    try {
+      findings.push(JSON.parse(stored));
+    } catch (err) {
+      console.error(`Invalid pending pool record ${key.name}:`, err.message);
+    }
+  }
+  return findings;
+}
+
+async function checkPendingPools(env, rpcUrl) {
+  const findings = [];
+  for (const finding of await getPendingPoolFindings(env)) {
+    try {
+      const liquidity = await getPoolLiquidity(finding, rpcUrl, env);
+      if (liquidity.zeroLiquidity) continue;
+      findings.push({
+        ...finding,
+        alertKind: "LIQUIDITY_ADDED",
+        liquidity,
+        filterResult: { passes: true, reason: "Liquidity added to tracked pool" },
+        signal: computeSignalScore(finding, liquidity),
+      });
+      await env.BOT_STATE.delete(getPendingPoolKey(finding));
+    } catch (err) {
+      if (err.message === "SUBREQUEST_BUDGET_REACHED") break;
+      console.error(`Pending pool check failed for ${finding.txHash}:`, err.message);
+    }
+  }
+  return findings;
+}
+
 function formatAlertMessage(finding) {
   const tokenAddress = getNonWethTokenAddress(finding);
   const liquidity = finding.liquidity;
+  const title =
+    finding.alertKind === "ZERO_LIQUIDITY_LAUNCH"
+      ? "NEW TOKEN/POOL LAUNCH (ZERO LIQUIDITY)"
+      : finding.alertKind === "LIQUIDITY_ADDED"
+      ? "LIQUIDITY ADDED TO TRACKED POOL"
+      : "NEW ROBINHOOD ACTIVITY";
   const liquidityLine =
     liquidity.pairedWithWeth === true && liquidity.usd !== null
       ? `Liquidity: $${liquidity.usd.toLocaleString(undefined, { maximumFractionDigits: 0 })}${liquidity.estimated ? " (estimated)" : ""}`
@@ -449,7 +548,7 @@ function formatAlertMessage(finding) {
       : `Liquidity: N/A (${liquidity.note})`;
 
   return [
-    "NEW ROBINHOOD ACTIVITY",
+    title,
     "",
     `Token: \`${tokenAddress}\``,
     "Robinhood Chain",
@@ -568,7 +667,14 @@ async function checkForNewPools(env, fromBlock, toBlock, rpcUrl) {
 
         const filterResult = passesFilter(finding, liquidity);
         const signal = computeSignalScore(finding, liquidity);
-        findings.push({ ...finding, liquidity, filterResult, signal });
+        if (liquidity.zeroLiquidity) await rememberPendingPool(env, finding);
+        findings.push({
+          ...finding,
+          alertKind: liquidity.zeroLiquidity ? "ZERO_LIQUIDITY_LAUNCH" : undefined,
+          liquidity,
+          filterResult,
+          signal,
+        });
       }
       lastCompletedBlock = chunkEnd;
     } catch (err) {
@@ -611,16 +717,25 @@ export default {
       subrequestReserve = ALERT_SUBREQUEST_RESERVE;
       let scan;
       try {
+        const pendingFindings = await checkPendingPools(env, rpcUrl);
         scan = await checkForNewPools(env, lastBlock + 1, currentBlock, rpcUrl);
+        scan.findings.unshift(...pendingFindings);
       } finally {
         subrequestReserve = 0;
       }
       const findings = scan.findings;
+      for (const finding of findings) {
+        if (finding.alertKind === "ZERO_LIQUIDITY_LAUNCH") {
+          finding.filterResult = { passes: true, reason: "New pool detected before liquidity was added" };
+        }
+      }
+      findings.unshift(...pendingFindings);
       console.log(`Checked blocks ${lastBlock + 1} to ${currentBlock}. Found ${findings.length} new pool(s).`);
       for (const f of findings) {
         const status = f.filterResult.passes ? "ALERT-WORTHY" : "filtered";
+        const alertKind = f.alertKind ? ` | ${f.alertKind}` : "";
         console.log(
-          `${status} | ${f.source} ${f.type} | Signal ${f.signal.score}/${f.signal.maxPossibleRightNow} | ${f.filterResult.reason}`
+          `${status}${alertKind} | ${f.source} ${f.type} | Signal ${f.signal.score}/${f.signal.maxPossibleRightNow} | ${f.filterResult.reason}`
         );
 
         if (!f.filterResult.passes) continue;
@@ -631,7 +746,7 @@ export default {
         }
 
         const tokenAddress = getNonWethTokenAddress(f);
-        if (await isOnCooldown(env, tokenAddress)) {
+        if (f.alertKind !== "LIQUIDITY_ADDED" && (await isOnCooldown(env, tokenAddress))) {
           console.log(`Token ${tokenAddress} is on cooldown, skipping`);
           continue;
         }
