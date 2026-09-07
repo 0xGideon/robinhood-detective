@@ -275,15 +275,18 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
   }
 
   if (!v4LiquidityDiagnosticLogged) {
+    v4LiquidityDiagnosticLogged = true;
     const poolId = finding.id;
+    console.log(`V4 diagnostic debug | typeof id: ${typeof poolId} | value: ${String(poolId)}`);
     if (typeof poolId === "string" && /^0x[0-9a-f]{64}$/i.test(poolId)) {
-      v4LiquidityDiagnosticLogged = true;
       try {
         const liquidity = await getV4Liquidity(poolId, rpcUrl);
         console.log(`V4 liquidity diagnostic | pool ${poolId} | raw liquidity ${liquidity}`);
       } catch (err) {
         console.error(`V4 liquidity diagnostic failed | pool ${poolId}:`, err.message);
       }
+    } else {
+      console.log("V4 diagnostic skipped: id did not match expected bytes32 shape");
     }
   }
 
