@@ -1,4 +1,4 @@
-import { keccak256, toHex, decodeEventLog, parseAbiItem } from "viem";
+import { keccak256, toHex, encodePacked, decodeEventLog, parseAbiItem, toFunctionSelector } from "viem";
 
 // ---- Our verified contract addresses (Robinhood Chain) ----
 const RPC_URL = "https://rpc.mainnet.chain.robinhood.com";
@@ -17,12 +17,16 @@ const RPC_REQUEST_SPACING_MS = 150;
 const COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd";
 const GET_RESERVES_SELECTOR = "0x0902f1ac";
 const BALANCE_OF_SELECTOR = "0x70a08231";
+const POOLS_SLOT = 6n;
+const LIQUIDITY_OFFSET = 3n;
+const EXTSLOAD_SELECTOR = toFunctionSelector("extsload(bytes32)");
 
 let cachedEthPrice = null;
 let cachedEthPriceTime = 0;
 let ethPricePromise = null;
 let subrequestCount = 0;
 let subrequestReserve = 0;
+let v4LiquidityDiagnosticLogged = false;
 let preferredRpcUrl = RPC_URL;
 
 // ---- Configurable settings (from the original spec) ----
@@ -198,6 +202,25 @@ async function ethCall(to, data, rpcUrl) {
   return rpcCall("eth_call", [{ to, data }, "latest"], rpcUrl);
 }
 
+function getPoolStateSlot(poolId) {
+  return keccak256(encodePacked(["bytes32", "uint256"], [poolId, POOLS_SLOT]));
+}
+
+async function getV4Liquidity(poolId, rpcUrl) {
+  const stateSlot = getPoolStateSlot(poolId);
+  const liquiditySlotNumber = BigInt(stateSlot) + LIQUIDITY_OFFSET;
+  const liquiditySlot = `0x${liquiditySlotNumber.toString(16).padStart(64, "0")}`;
+  const raw = await ethCall(
+    UNISWAP_V4_POOL_MANAGER,
+    `${EXTSLOAD_SELECTOR}${liquiditySlot.slice(2)}`,
+    rpcUrl
+  );
+  if (typeof raw !== "string" || !/^0x[0-9a-f]{64}$/i.test(raw)) {
+    throw new Error("Invalid V4 liquidity storage response");
+  }
+  return BigInt(raw);
+}
+
 async function getPoolLiquidity(finding, rpcUrl, env) {
   if (finding.source === "Uniswap V2") {
     const raw = await ethCall(finding.pair, GET_RESERVES_SELECTOR, rpcUrl);
@@ -249,6 +272,19 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
       usd: ethPrice === null ? null : wethAmount * ethPrice,
       ...(ethPrice === null ? { note: "WETH price unavailable this run" } : {}),
     };
+  }
+
+  if (!v4LiquidityDiagnosticLogged) {
+    const poolId = finding.id;
+    if (typeof poolId === "string" && /^0x[0-9a-f]{64}$/i.test(poolId)) {
+      v4LiquidityDiagnosticLogged = true;
+      try {
+        const liquidity = await getV4Liquidity(poolId, rpcUrl);
+        console.log(`V4 liquidity diagnostic | pool ${poolId} | raw liquidity ${liquidity}`);
+      } catch (err) {
+        console.error(`V4 liquidity diagnostic failed | pool ${poolId}:`, err.message);
+      }
+    }
   }
 
   return { pairedWithWeth: null, note: "N/A - V4 per-pool liquidity math not yet implemented" };
@@ -475,6 +511,7 @@ export default {
   async scheduled(event, env, ctx) {
     subrequestCount = 0;
     subrequestReserve = 0;
+    v4LiquidityDiagnosticLogged = false;
     ethPricePromise = null;
     preferredRpcUrl = env.RPC_URL || RPC_URL;
     const rpcUrl = env.RPC_URL || RPC_URL;
