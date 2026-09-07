@@ -17,6 +17,7 @@ const EXPLORER_BASE = "https://robinhoodchain.blockscout.com/address";
 const WETH_ADDRESS = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
 // Add more addresses here if you learn the contract address for QQQ or other Robinhood Chain quote assets.
 const ANCHOR_TOKENS = [WETH_ADDRESS];
+const IGNORED_PAIRS = new Set(["USDG/WETH"]);
 
 const MAX_ADDRESSES_PER_CALL = 30;
 const MAX_SUBREQUESTS_PER_RUN = 45; // Cloudflare Workers subrequest ceiling headroom
@@ -130,6 +131,14 @@ function escapeMd(text) {
   return String(text).replace(/([_*[\]`])/g, "\\$1");
 }
 
+function isIgnoredPair(pair) {
+  const symbols = [pair.baseToken?.symbol, pair.quoteToken?.symbol]
+    .filter(Boolean)
+    .map((symbol) => String(symbol).toUpperCase())
+    .sort();
+  return symbols.length === 2 && IGNORED_PAIRS.has(symbols.join("/"));
+}
+
 // ---------------------------------------------------------------------------
 // DexScreener API calls
 // ---------------------------------------------------------------------------
@@ -160,7 +169,9 @@ async function fetchAllChainPairs() {
     }
   }
   return [...seen.values()].filter(
-    (pair) => (pair.liquidity?.usd ?? 0) >= CONFIG.THRESHOLDS.MIN_LIQUIDITY_TO_TRACK
+    (pair) =>
+      !isIgnoredPair(pair) &&
+      (pair.liquidity?.usd ?? 0) >= CONFIG.THRESHOLDS.MIN_LIQUIDITY_TO_TRACK
   );
 }
 
@@ -299,7 +310,9 @@ async function discoverBoosts(env, polledAt) {
   for (const boost of unseen) {
     await markKnown(env, `knownBoost:${boost.tokenAddress.toLowerCase()}`, 30 * 24 * 60 * 60);
     const tokenPairs = pairs.filter(
-      (p) => p.baseToken?.address?.toLowerCase() === boost.tokenAddress.toLowerCase()
+      (p) =>
+        !isIgnoredPair(p) &&
+        p.baseToken?.address?.toLowerCase() === boost.tokenAddress.toLowerCase()
     );
     const primary = pickPrimaryPair(tokenPairs);
     if (!primary) continue; // boosted but no live pair on this chain yet
@@ -677,6 +690,11 @@ async function sendTelegramMessage(env, text) {
 
 async function dispatchAlerts(env, alerts) {
   for (const alert of alerts) {
+    if (isIgnoredPair(alert.pair)) {
+      console.log(`Skipping ${alert.kind} for ignored pair ${alert.pair.pairAddress}`);
+      continue;
+    }
+
     const pairAddress = alert.pair.pairAddress;
     const cooldownKind = cooldownKindFor(alert.kind);
 
