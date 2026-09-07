@@ -729,7 +729,6 @@ export default {
           finding.filterResult = { passes: true, reason: "New pool detected before liquidity was added" };
         }
       }
-      findings.unshift(...pendingFindings);
       console.log(`Checked blocks ${lastBlock + 1} to ${currentBlock}. Found ${findings.length} new pool(s).`);
       for (const f of findings) {
         const status = f.filterResult.passes ? "ALERT-WORTHY" : "filtered";
