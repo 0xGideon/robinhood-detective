@@ -241,11 +241,9 @@ async function getTokenText(tokenAddress, selector, rpcUrl) {
 }
 
 async function getTokenMetadata(tokenAddress, rpcUrl) {
-  const [name, symbol, decimals] = await Promise.all([
-    getTokenText(tokenAddress, NAME_SELECTOR, rpcUrl),
-    getTokenText(tokenAddress, SYMBOL_SELECTOR, rpcUrl),
-    getTokenDecimalsOrDefault(tokenAddress, rpcUrl, null),
-  ]);
+  const name = await getTokenText(tokenAddress, NAME_SELECTOR, rpcUrl);
+  const symbol = await getTokenText(tokenAddress, SYMBOL_SELECTOR, rpcUrl);
+  const decimals = await getTokenDecimalsOrDefault(tokenAddress, rpcUrl, null);
   return { name, symbol, decimals };
 }
 
