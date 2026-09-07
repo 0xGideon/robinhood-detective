@@ -1,4 +1,12 @@
-import { keccak256, toHex, encodePacked, decodeEventLog, parseAbiItem, toFunctionSelector } from "viem";
+import {
+  keccak256,
+  toHex,
+  encodePacked,
+  decodeAbiParameters,
+  decodeEventLog,
+  parseAbiItem,
+  toFunctionSelector,
+} from "viem";
 
 // ---- Our verified contract addresses (Robinhood Chain) ----
 const RPC_URL = "https://rpc.mainnet.chain.robinhood.com";
@@ -20,6 +28,8 @@ const COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereu
 const GET_RESERVES_SELECTOR = "0x0902f1ac";
 const BALANCE_OF_SELECTOR = "0x70a08231";
 const DECIMALS_SELECTOR = "0x313ce567";
+const NAME_SELECTOR = "0x06fdde03";
+const SYMBOL_SELECTOR = "0x95d89b41";
 const Q96 = 2n ** 96n;
 const POOLS_SLOT = 6n;
 const LIQUIDITY_OFFSET = 3n;
@@ -218,6 +228,33 @@ async function getTokenDecimalsOrDefault(tokenAddress, rpcUrl, fallback = 18) {
   return fallback;
 }
 
+async function getTokenText(tokenAddress, selector, rpcUrl) {
+  try {
+    const raw = await ethCall(tokenAddress, selector, rpcUrl);
+    if (typeof raw === "string" && /^0x[0-9a-f]+$/i.test(raw)) {
+      return decodeAbiParameters([{ type: "string" }], raw)[0];
+    }
+  } catch (err) {
+    console.error(`Token metadata lookup failed for ${tokenAddress}:`, err.message);
+  }
+  return null;
+}
+
+async function getTokenMetadata(tokenAddress, rpcUrl) {
+  const [name, symbol, decimals] = await Promise.all([
+    getTokenText(tokenAddress, NAME_SELECTOR, rpcUrl),
+    getTokenText(tokenAddress, SYMBOL_SELECTOR, rpcUrl),
+    getTokenDecimalsOrDefault(tokenAddress, rpcUrl, null),
+  ]);
+  return { name, symbol, decimals };
+}
+
+function getNonWethTokenForFinding(finding) {
+  const token0 = finding.token0 || finding.currency0;
+  const token1 = finding.token1 || finding.currency1;
+  return token0?.toLowerCase() === WETH_ADDRESS.toLowerCase() ? token1 : token0;
+}
+
 async function getTokenBalance(tokenAddress, account, rpcUrl) {
   const raw = await ethCall(
     tokenAddress,
@@ -263,10 +300,12 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
 
     if (!token0IsWeth && !token1IsWeth) {
       if (reserve0 === 0n && reserve1 === 0n) {
+        const tokenMetadata = await getTokenMetadata(getNonWethTokenForFinding(finding), rpcUrl);
         return {
           pairedWithWeth: false,
           token0Amount: 0,
           token1Amount: 0,
+          ...tokenMetadata,
           zeroLiquidity: true,
           note: "Non-WETH pair - zero liquidity",
         };
@@ -303,10 +342,12 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
         getTokenBalance(finding.token1, finding.pool, rpcUrl),
       ]);
       if (balance0 === 0n && balance1 === 0n) {
+        const tokenMetadata = await getTokenMetadata(getNonWethTokenForFinding(finding), rpcUrl);
         return {
           pairedWithWeth: false,
           token0Amount: 0,
           token1Amount: 0,
+          ...tokenMetadata,
           zeroLiquidity: true,
           note: "Non-WETH pair - zero liquidity",
         };
@@ -353,11 +394,16 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
   const currency1 = finding.currency1;
   const token0IsWeth = currency0.toLowerCase() === WETH_ADDRESS.toLowerCase();
   const token1IsWeth = currency1.toLowerCase() === WETH_ADDRESS.toLowerCase();
+  const tokenMetadata =
+    liquidity === 0n || token0IsWeth || token1IsWeth
+      ? await getTokenMetadata(getNonWethTokenForFinding(finding), rpcUrl)
+      : {};
 
   if (liquidity === 0n || sqrtPriceX96 === 0n) {
     return {
       pairedWithWeth: token0IsWeth || token1IsWeth,
       usd: token0IsWeth || token1IsWeth ? 0 : null,
+      ...tokenMetadata,
       zeroLiquidity: true,
       note: "V4 pool not yet funded (zero liquidity)",
     };
@@ -374,6 +420,7 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
     return {
       pairedWithWeth: false,
       estimated: true,
+      ...tokenMetadata,
       zeroLiquidity: false,
       token0Amount: Number(virtualReserve0) / 10 ** decimals0,
       token1Amount: Number(virtualReserve1) / 10 ** decimals1,
@@ -387,6 +434,7 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
   return {
     pairedWithWeth: true,
     estimated: true,
+    ...tokenMetadata,
     zeroLiquidity: false,
     wethAmount,
     usd: ethPrice === null ? null : wethAmount * ethPrice,
@@ -513,10 +561,11 @@ async function checkPendingPools(env, rpcUrl) {
     try {
       const liquidity = await getPoolLiquidity(finding, rpcUrl, env);
       if (liquidity.zeroLiquidity) continue;
+      const tokenMetadata = await getTokenMetadata(getNonWethTokenForFinding(finding), rpcUrl);
       findings.push({
         ...finding,
         alertKind: "LIQUIDITY_ADDED",
-        liquidity,
+        liquidity: { ...liquidity, ...tokenMetadata },
         filterResult: { passes: true, reason: "Liquidity added to tracked pool" },
         signal: computeSignalScore(finding, liquidity),
       });
@@ -532,6 +581,14 @@ async function checkPendingPools(env, rpcUrl) {
 function formatAlertMessage(finding) {
   const tokenAddress = getNonWethTokenAddress(finding);
   const liquidity = finding.liquidity;
+  const tokenLabel = liquidity.symbol || liquidity.name
+    ? `${liquidity.name || "Unknown token"} (${liquidity.symbol || "?"})`
+    : "Unknown token";
+  const tokenDetails = [
+    `Token: ${tokenLabel}`,
+    `Decimals: ${liquidity.decimals ?? "unknown"}`,
+    `Contract: \`${tokenAddress}\``,
+  ];
   const title =
     finding.alertKind === "ZERO_LIQUIDITY_LAUNCH"
       ? "NEW TOKEN/POOL LAUNCH (ZERO LIQUIDITY)"
@@ -550,7 +607,7 @@ function formatAlertMessage(finding) {
   return [
     title,
     "",
-    `Token: \`${tokenAddress}\``,
+    ...tokenDetails,
     "Robinhood Chain",
     `DEX: ${finding.source}`,
     liquidityLine,
@@ -558,7 +615,6 @@ function formatAlertMessage(finding) {
     `Signal: ${finding.signal.score}/${finding.signal.maxPossibleRightNow}`,
     `Why it triggered: ${finding.signal.reasons.map((reason) => `- ${reason}`).join("\n")}`,
     "",
-    `Contract: \`${tokenAddress}\``,
     `Explorer: https://robinhoodchain.blockscout.com/address/${tokenAddress}`,
     "",
     "DYOR. Not financial advice. Independent bot, not affiliated with Robinhood.",
