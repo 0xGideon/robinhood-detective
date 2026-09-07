@@ -14,34 +14,36 @@
 const DEXSCREENER_BASE = "https://api.dexscreener.com";
 const CHAIN_ID = "robinhood";
 const EXPLORER_BASE = "https://robinhoodchain.blockscout.com/address";
+const WETH_ADDRESS = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
+// Add more addresses here if you learn the contract address for QQQ or other Robinhood Chain quote assets.
+const ANCHOR_TOKENS = [WETH_ADDRESS];
 
 const MAX_ADDRESSES_PER_CALL = 30;
 const MAX_SUBREQUESTS_PER_RUN = 45; // Cloudflare Workers subrequest ceiling headroom
 const ALERT_SUBREQUEST_RESERVE = 5; // keep room for Telegram sends after data fetching
-const MAX_NEW_TOKENS_PER_RUN = 30; // cap discovery fan-out per run
-const WATCHLIST_MAX_TOKENS = 300; // FIFO cap so KV/requests don't grow unbounded
 
 const CONFIG = {
   MAX_ALERTS_PER_HOUR: 40,
   THRESHOLDS: {
-    LIQUIDITY_PCT: 0.2, // 20%
-    LIQUIDITY_MIN_USD_MOVE: 1000,
-    VOLUME_MULTIPLIER: 3, // 3x trailing average
+    LIQUIDITY_PCT: 0.3,
+    LIQUIDITY_MIN_USD_MOVE: 2500,
+    VOLUME_MULTIPLIER: 3,
     VOLUME_MIN_USD: 250,
-    PRICE_PCT_5M: 15, // percent
-    PRICE_PCT_1H: 30, // percent
+    PRICE_PCT_5M: 25,
+    PRICE_PCT_1H: 60,
     IMBALANCE_RATIO: 10, // 10:1
     IMBALANCE_MIN_TXNS: 10,
     FDV_TIERS: [50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000, 10_000_000],
     DEAD_LIQUIDITY_MIN_PEAK_TO_TRACK: 500, // only track "peak" once a pool had real liquidity
     DEAD_LIQUIDITY_PCT_OF_PEAK: 0.1, // below 10% of peak
     DEAD_LIQUIDITY_MIN_USD: 200, // or below this absolute floor
+    MIN_LIQUIDITY_TO_TRACK: 5000,
   },
   COOLDOWN_MINUTES: {
-    LIQUIDITY_SPIKE: 15,
-    LIQUIDITY_DRAIN: 15,
+    LIQUIDITY_SPIKE: 20,
+    LIQUIDITY_DRAIN: 20,
     VOLUME_SURGE: 15,
-    PRICE_MOVE: 10,
+    PRICE_MOVE: 20,
     IMBALANCE: 15,
   },
   VOLUME_HISTORY_SAMPLES: 10, // 10 samples x 3min cron = ~30min trailing baseline
@@ -123,14 +125,14 @@ function fmtPrice(n) {
   return n < 0.01 ? `$${n.toFixed(8).replace(/0+$/, "").replace(/\.$/, "")}` : `$${n.toFixed(4)}`;
 }
 
+function escapeMd(text) {
+  if (text === null || text === undefined) return text;
+  return String(text).replace(/([_*[\]`])/g, "\\$1");
+}
+
 // ---------------------------------------------------------------------------
 // DexScreener API calls
 // ---------------------------------------------------------------------------
-
-async function fetchLatestProfiles() {
-  const data = await fetchJson(`${DEXSCREENER_BASE}/token-profiles/latest/v1`);
-  return Array.isArray(data) ? data : [];
-}
 
 async function fetchLatestBoosts() {
   const data = await fetchJson(`${DEXSCREENER_BASE}/token-boosts/latest/v1`);
@@ -144,6 +146,22 @@ async function fetchPairsForTokenBatch(tokenAddresses) {
   const data = await fetchJson(url);
   const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
   return pairs.filter((p) => p.chainId === CHAIN_ID);
+}
+
+async function fetchAllChainPairs() {
+  const seen = new Map();
+  for (const anchor of ANCHOR_TOKENS) {
+    try {
+      const pairs = await fetchPairsForTokenBatch([anchor]);
+      for (const pair of pairs) seen.set(pair.pairAddress.toLowerCase(), pair);
+    } catch (err) {
+      if (err.message === "SUBREQUEST_BUDGET_REACHED") throw err;
+      console.error(`Anchor discovery failed for ${anchor}:`, err.message);
+    }
+  }
+  return [...seen.values()].filter(
+    (pair) => (pair.liquidity?.usd ?? 0) >= CONFIG.THRESHOLDS.MIN_LIQUIDITY_TO_TRACK
+  );
 }
 
 // Handles >30 addresses by chunking, and stops gracefully if the subrequest budget runs out.
@@ -170,38 +188,52 @@ function pickPrimaryPair(pairs) {
   }, null);
 }
 
+function getSubjectToken(pair) {
+  const anchorSet = new Set(ANCHOR_TOKENS.map((anchor) => anchor.toLowerCase()));
+  const baseAddr = pair.baseToken?.address?.toLowerCase();
+  const quoteAddr = pair.quoteToken?.address?.toLowerCase();
+
+  if (baseAddr && !anchorSet.has(baseAddr)) {
+    return {
+      symbol: pair.baseToken?.symbol ?? "?",
+      name: pair.baseToken?.name ?? "Unknown token",
+      address: pair.baseToken?.address,
+      otherSymbol: pair.quoteToken?.symbol ?? "?",
+    };
+  }
+  if (quoteAddr && !anchorSet.has(quoteAddr)) {
+    return {
+      symbol: pair.quoteToken?.symbol ?? "?",
+      name: pair.quoteToken?.name ?? "Unknown token",
+      address: pair.quoteToken?.address,
+      otherSymbol: pair.baseToken?.symbol ?? "?",
+    };
+  }
+  return {
+    symbol: pair.baseToken?.symbol ?? "?",
+    name: pair.baseToken?.name ?? "Unknown token",
+    address: pair.baseToken?.address,
+    otherSymbol: pair.quoteToken?.symbol ?? "?",
+  };
+}
+
 // ---------------------------------------------------------------------------
 // KV state helpers
 // ---------------------------------------------------------------------------
 
-async function getWatchlist(env) {
-  const raw = await env.BOT_STATE.get("watchlist");
-  if (!raw) return [];
+async function getAllPairStates(env) {
+  const raw = await env.BOT_STATE.get("pairStates");
+  if (!raw) return {};
   try {
-    const list = JSON.parse(raw);
-    return Array.isArray(list) ? list : [];
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
-    return [];
+    return {};
   }
 }
 
-async function saveWatchlist(env, list) {
-  const trimmed = list.length > WATCHLIST_MAX_TOKENS ? list.slice(list.length - WATCHLIST_MAX_TOKENS) : list;
-  await env.BOT_STATE.put("watchlist", JSON.stringify(trimmed));
-}
-
-async function getPairState(env, pairAddress) {
-  const raw = await env.BOT_STATE.get(`pair:${pairAddress.toLowerCase()}`);
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-async function savePairState(env, pairAddress, state) {
-  await env.BOT_STATE.put(`pair:${pairAddress.toLowerCase()}`, JSON.stringify(state));
+async function saveAllPairStates(env, states) {
+  await env.BOT_STATE.put("pairStates", JSON.stringify(states));
 }
 
 async function isKnown(env, key) {
@@ -233,66 +265,6 @@ async function incrementHourlyCap(env) {
   const count = countStr ? Number.parseInt(countStr, 10) : 0;
   const next = Number.isSafeInteger(count) && count >= 0 ? count + 1 : 1;
   await env.BOT_STATE.put("hourlyAlertCount", next.toString(), { expirationTtl: 60 * 60 });
-}
-
-// ---------------------------------------------------------------------------
-// Feature 1 — New Pair discovery (via token-profiles/latest/v1)
-// ---------------------------------------------------------------------------
-
-async function discoverNewPairs(env, polledAt) {
-  const alerts = [];
-  let profiles;
-  try {
-    profiles = await fetchLatestProfiles();
-  } catch (err) {
-    console.error("Profile discovery failed:", err.message);
-    return alerts;
-  }
-
-  const chainTokens = profiles.filter((p) => p.chainId === CHAIN_ID).map((p) => p.tokenAddress);
-  const unseenTokens = [];
-  for (const tokenAddress of chainTokens) {
-    if (unseenTokens.length >= MAX_NEW_TOKENS_PER_RUN) break;
-    if (!(await isKnown(env, `knownToken:${tokenAddress.toLowerCase()}`))) {
-      unseenTokens.push(tokenAddress);
-    }
-  }
-  if (unseenTokens.length === 0) return alerts;
-
-  let pairs;
-  try {
-    pairs = await fetchPairsForTokens(unseenTokens);
-  } catch (err) {
-    console.error("Fetching pairs for new tokens failed:", err.message);
-    return alerts;
-  }
-
-  const watchlist = await getWatchlist(env);
-  const watchlistTokens = new Set(watchlist.map((w) => w.tokenAddress.toLowerCase()));
-
-  for (const tokenAddress of unseenTokens) {
-    const tokenPairs = pairs.filter(
-      (p) => p.baseToken?.address?.toLowerCase() === tokenAddress.toLowerCase()
-    );
-    const primary = pickPrimaryPair(tokenPairs);
-
-    // Mark known regardless of whether a pair exists yet, so we don't re-check every run.
-    await markKnown(env, `knownToken:${tokenAddress.toLowerCase()}`, 30 * 24 * 60 * 60);
-
-    if (!primary) continue; // profile exists but no live Robinhood Chain pair yet
-
-    alerts.push({ kind: "NEW_PAIR", pair: primary, polledAt });
-
-    if (!watchlistTokens.has(tokenAddress.toLowerCase())) {
-      watchlist.push({ tokenAddress, pairAddress: primary.pairAddress, addedAt: polledAt });
-      watchlistTokens.add(tokenAddress.toLowerCase());
-    }
-
-    await savePairState(env, primary.pairAddress, snapshotFromPair(primary, polledAt, null));
-  }
-
-  await saveWatchlist(env, watchlist);
-  return alerts;
 }
 
 // ---------------------------------------------------------------------------
@@ -353,18 +325,26 @@ function snapshotFromPair(pair, polledAt, prevState) {
     liquidityUsd !== null && liquidityUsd >= CONFIG.THRESHOLDS.DEAD_LIQUIDITY_MIN_PEAK_TO_TRACK
       ? Math.max(priorPeak, liquidityUsd)
       : priorPeak;
+  const capValue = pair.marketCap ?? pair.fdv ?? null;
+  const initialFdvTier = capValue === null
+    ? 0
+    : CONFIG.THRESHOLDS.FDV_TIERS.reduce(
+        (tier, threshold) => (capValue >= threshold ? threshold : tier),
+        0
+      );
+  const subject = getSubjectToken(pair);
 
   return {
-    symbol: pair.baseToken?.symbol ?? "?",
-    name: pair.baseToken?.name ?? "Unknown token",
-    tokenAddress: pair.baseToken?.address,
+    symbol: subject.symbol,
+    name: subject.name,
+    tokenAddress: subject.address,
     dexId: pair.dexId,
     url: pair.url,
     liquidityUsd,
     volumeHistory,
     priceUsd: pair.priceUsd ? Number(pair.priceUsd) : null,
     peakLiquidityUsd,
-    lastFdvTier: prevState?.lastFdvTier ?? 0,
+    lastFdvTier: prevState?.lastFdvTier ?? initialFdvTier,
     isDead: prevState?.isDead ?? false,
     polledAt,
   };
@@ -462,32 +442,45 @@ function evaluatePair(pair, prevState, polledAt) {
   return { alerts, nextState, pairAddress };
 }
 
-async function pollWatchlist(env, polledAt) {
-  const watchlist = await getWatchlist(env);
-  if (watchlist.length === 0) return [];
-
-  const tokenAddresses = [...new Set(watchlist.map((w) => w.tokenAddress))];
-  let pairs;
-  try {
-    pairs = await fetchPairsForTokens(tokenAddresses);
-  } catch (err) {
-    console.error("Watchlist poll failed:", err.message);
-    return [];
-  }
-
-  const pairsByAddress = new Map(pairs.map((p) => [p.pairAddress.toLowerCase(), p]));
+async function pollAllPairs(env, polledAt) {
+  const pairs = await fetchAllChainPairs();
+  const backfilled = await isKnown(env, "anchorBackfillDone");
+  const baselined = await isKnown(env, "anchorStateBaselineDone");
+  const allStates = await getAllPairStates(env);
+  const migratingToConsolidatedState = backfilled && Object.keys(allStates).length === 0;
   const alerts = [];
 
-  for (const entry of watchlist) {
-    const pair = pairsByAddress.get(entry.pairAddress.toLowerCase());
-    if (!pair) continue; // pair may no longer be returned (delisted / no liquidity)
+  for (const pair of pairs) {
+    const pairAddress = pair.pairAddress.toLowerCase();
+    const prevState = allStates[pairAddress] ?? null;
 
-    const prevState = await getPairState(env, entry.pairAddress);
+    if (!prevState && (!backfilled || migratingToConsolidatedState)) {
+      allStates[pairAddress] = snapshotFromPair(pair, polledAt, null);
+      continue;
+    }
+
+    if (!baselined) {
+      const capValue = pair.marketCap ?? pair.fdv ?? null;
+      const correctTier =
+        capValue === null
+          ? 0
+          : CONFIG.THRESHOLDS.FDV_TIERS.reduce((tier, threshold) => (capValue >= threshold ? threshold : tier), 0);
+      const repaired = snapshotFromPair(pair, polledAt, prevState);
+      repaired.lastFdvTier = correctTier;
+      allStates[pairAddress] = repaired;
+      continue;
+    }
+
+    if (!prevState) alerts.push({ kind: "NEW_PAIR", pair, polledAt });
+
     const { alerts: pairAlerts, nextState } = evaluatePair(pair, prevState, polledAt);
     alerts.push(...pairAlerts);
-    await savePairState(env, entry.pairAddress, nextState);
+    allStates[pairAddress] = nextState;
   }
 
+  await saveAllPairStates(env, allStates);
+  if (!backfilled) await markKnown(env, "anchorBackfillDone", null);
+  if (!baselined) await markKnown(env, "anchorStateBaselineDone", null);
   return alerts;
 }
 
@@ -504,9 +497,11 @@ function dataAgeLine(polledAt) {
 
 function formatAlertMessage(alert) {
   const { kind, pair, polledAt } = alert;
-  const symbol = pair.baseToken?.symbol ?? "?";
-  const name = pair.baseToken?.name ?? "Unknown token";
-  const tokenAddress = pair.baseToken?.address ?? "unknown";
+  const subject = getSubjectToken(pair);
+  const symbol = escapeMd(subject.symbol);
+  const name = escapeMd(subject.name);
+  const tokenAddress = subject.address ?? "unknown";
+  const pairLabel = `${escapeMd(pair.baseToken?.symbol ?? "?")}/${escapeMd(pair.quoteToken?.symbol ?? "?")}`;
   const liquidityUsd = pair.liquidity?.usd ?? null;
 
   switch (kind) {
@@ -516,7 +511,7 @@ function formatAlertMessage(alert) {
         "🆕 NEW PAIR — Robinhood Chain",
         "",
         `Token: $${symbol} (${name})`,
-        `Pair: ${symbol}/${pair.quoteToken?.symbol ?? "?"} on ${pair.dexId ?? "unknown DEX"}`,
+        `Pair: ${symbol}/${escapeMd(subject.otherSymbol)} on ${escapeMd(pair.dexId ?? "unknown DEX")}`,
         `Liquidity: ${fmtUsd(liquidityUsd)}`,
         `Created: ${createdAgo}`,
         "",
@@ -533,7 +528,7 @@ function formatAlertMessage(alert) {
       const isSpike = kind === "LIQUIDITY_SPIKE";
       const pctStr = `${isSpike ? "+" : ""}${(alert.pctChange * 100).toFixed(0)}%`;
       return [
-        `${isSpike ? "💧 LIQUIDITY SURGE" : "🩸 LIQUIDITY DRAIN"} — $${symbol}`,
+        `${isSpike ? "💧 LIQUIDITY SURGE" : "🩸 LIQUIDITY DRAIN"} — ${pairLabel}`,
         "",
         `${pctStr} liquidity in the last poll`,
         `${fmtUsd(alert.prevLiquidityUsd)} → ${fmtUsd(liquidityUsd)}`,
@@ -549,7 +544,7 @@ function formatAlertMessage(alert) {
       const buys = pair.txns?.m5?.buys ?? 0;
       const sells = pair.txns?.m5?.sells ?? 0;
       return [
-        `📈 VOLUME SURGE — $${symbol}`,
+        `📈 VOLUME SURGE — ${pairLabel}`,
         "",
         `5min volume: ${fmtUsd(pair.volume?.m5)} (${alert.multiplier.toFixed(1)}x trailing avg)`,
         `Buys: ${buys} · Sells: ${sells}`,
@@ -564,7 +559,7 @@ function formatAlertMessage(alert) {
     case "PRICE_DUMP": {
       const isPump = kind === "PRICE_PUMP";
       return [
-        `${isPump ? "🚀 PRICE PUMP" : "📉 PRICE DUMP"} — $${symbol}`,
+        `${isPump ? "🚀 PRICE PUMP" : "📉 PRICE DUMP"} — ${pairLabel}`,
         "",
         `${isPump ? "+" : ""}${alert.pct.toFixed(0)}% in ${alert.window}`,
         `Current price: ${fmtPrice(pair.priceUsd ? Number(pair.priceUsd) : null)}`,
@@ -579,7 +574,7 @@ function formatAlertMessage(alert) {
     case "IMBALANCE_SELL": {
       const isBuy = kind === "IMBALANCE_BUY";
       return [
-        `⚖️ ${isBuy ? "BUY" : "SELL"} IMBALANCE — $${symbol}`,
+        `⚖️ ${isBuy ? "BUY" : "SELL"} IMBALANCE — ${pairLabel}`,
         "",
         `${alert.buys} buys vs ${alert.sells} sells (5min)`,
         `Heavy one-sided flow — ${isBuy ? "early momentum or wash pattern" : "possible exit pressure"}`,
@@ -592,7 +587,7 @@ function formatAlertMessage(alert) {
 
     case "BOOSTED": {
       return [
-        `🚀 TOKEN BOOSTED — $${symbol}`,
+        `🚀 TOKEN BOOSTED — ${pairLabel}`,
         "",
         "Just purchased a DexScreener boost",
         `Boost amount: ${alert.boost?.amount ?? "unknown"}`,
@@ -605,7 +600,7 @@ function formatAlertMessage(alert) {
 
     case "MILESTONE": {
       return [
-        `🎯 MILESTONE — $${symbol}`,
+        `🎯 MILESTONE — ${pairLabel}`,
         "",
         `Market cap crossed ${fmtUsd(alert.tier)}`,
         `Current FDV: ${fmtUsd(alert.fdv)}`,
@@ -618,7 +613,7 @@ function formatAlertMessage(alert) {
 
     case "DEAD": {
       return [
-        `☠️ LIQUIDITY COLLAPSE — $${symbol}`,
+        `☠️ LIQUIDITY COLLAPSE — ${pairLabel}`,
         "",
         `Liquidity down to ${fmtUsd(alert.currentLiquidityUsd)} (was ${fmtUsd(alert.peakLiquidityUsd)} peak)`,
         "Token likely dead or rugged",
@@ -666,7 +661,7 @@ async function sendTelegramMessage(env, text) {
       chat_id: env.TELEGRAM_CHANNEL_ID,
       text,
       parse_mode: "Markdown",
-      disable_web_page_preview: false,
+      disable_web_page_preview: true,
     }),
   });
   const json = await res.json();
@@ -714,18 +709,17 @@ export default {
     const polledAt = Date.now();
 
     try {
-      const newPairAlerts = await discoverNewPairs(env, polledAt);
       const boostAlerts = await discoverBoosts(env, polledAt);
 
       subrequestReserve = ALERT_SUBREQUEST_RESERVE;
-      let watchAlerts = [];
+      let pairAlerts = [];
       try {
-        watchAlerts = await pollWatchlist(env, polledAt);
+        pairAlerts = await pollAllPairs(env, polledAt);
       } finally {
         subrequestReserve = 0;
       }
 
-      const allAlerts = [...newPairAlerts, ...boostAlerts, ...watchAlerts];
+      const allAlerts = [...boostAlerts, ...pairAlerts];
       console.log(`Polled Robinhood Chain via DexScreener. ${allAlerts.length} alert(s) generated.`);
 
       subrequestReserve = ALERT_SUBREQUEST_RESERVE;
@@ -745,9 +739,6 @@ export default {
 
   // Manual visits just report status — they do NOT trigger a real poll.
   async fetch(request, env, ctx) {
-    const watchlist = await getWatchlist(env);
-    return new Response(
-      `Robinhood Detective is alive. Tracking ${watchlist.length} token(s) on Robinhood Chain via DexScreener.`
-    );
+    return new Response("Robinhood Detective is alive, tracking Robinhood Chain via DexScreener.");
   },
 };
