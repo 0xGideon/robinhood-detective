@@ -9,6 +9,9 @@ id = "a5cd447820754ae3845354059a79fa6a"
 [triggers]
 crons = ["*/3 * * * *"]
 
+[vars]
+DRY_RUN = "false"
+
 [observability]
 enabled = true
 head_sampling_rate = 1

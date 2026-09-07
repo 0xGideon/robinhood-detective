@@ -1,131 +1,61 @@
-import {
-  keccak256,
-  toHex,
-  encodePacked,
-  decodeAbiParameters,
-  decodeEventLog,
-  parseAbiItem,
-  toFunctionSelector,
-} from "viem";
+// ============================================================================
+// Robinhood Detective — Cloudflare Worker
+// Data source: DexScreener public API (no RPC, no factory log scanning)
+// Channel: Robinhood Chain Inspector 🕵️‍♂️
+// ============================================================================
+// Cloudflare bindings/env expected (unchanged from the previous version):
+//   env.BOT_STATE            KV namespace
+//   env.TELEGRAM_BOT_TOKEN   secret
+//   env.TELEGRAM_CHANNEL_ID  secret
+//   env.DRY_RUN              "true"/"false" (defaults to "true")
+// Cron Trigger: keep your existing schedule (e.g. every 1 minute / 3 minutes).
+// ============================================================================
 
-// ---- Our verified contract addresses (Robinhood Chain) ----
-const RPC_URL = "https://rpc.mainnet.chain.robinhood.com";
-const RPC_FALLBACK_URLS = [
-  "https://robinhood-rpc.publicnode.com",
-  "https://rpc.ordofi.network",
-];
-const UNISWAP_V2_FACTORY = "0x8bceAA40B9acdfaEdf85adF4Ff01f5aD6517937f";
-const UNISWAP_V3_FACTORY = "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA";
-const UNISWAP_V4_POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
-const WETH_ADDRESS = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
-const MAX_LOG_BLOCK_RANGE = 500;
-const MAX_SUBREQUESTS_PER_RUN = 40;
-const ALERT_SUBREQUEST_RESERVE = 5;
-const MAX_PENDING_POOL_CHECKS_PER_RUN = 8;
-const PENDING_POOL_TTL_SECONDS = 24 * 60 * 60;
-const RPC_REQUEST_SPACING_MS = 150;
-const COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd";
-const GET_RESERVES_SELECTOR = "0x0902f1ac";
-const BALANCE_OF_SELECTOR = "0x70a08231";
-const DECIMALS_SELECTOR = "0x313ce567";
-const NAME_SELECTOR = "0x06fdde03";
-const SYMBOL_SELECTOR = "0x95d89b41";
-const Q96 = 2n ** 96n;
-const POOLS_SLOT = 6n;
-const LIQUIDITY_OFFSET = 3n;
-const EXTSLOAD_SELECTOR = toFunctionSelector("extsload(bytes32)");
+const DEXSCREENER_BASE = "https://api.dexscreener.com";
+const CHAIN_ID = "robinhood";
+const EXPLORER_BASE = "https://robinhoodchain.blockscout.com/address";
 
-let cachedEthPrice = null;
-let cachedEthPriceTime = 0;
-let ethPricePromise = null;
-let subrequestCount = 0;
-let subrequestReserve = 0;
-let preferredRpcUrl = RPC_URL;
+const MAX_ADDRESSES_PER_CALL = 30;
+const MAX_SUBREQUESTS_PER_RUN = 45; // Cloudflare Workers subrequest ceiling headroom
+const ALERT_SUBREQUEST_RESERVE = 5; // keep room for Telegram sends after data fetching
+const MAX_NEW_TOKENS_PER_RUN = 30; // cap discovery fan-out per run
+const WATCHLIST_MAX_TOKENS = 300; // FIFO cap so KV/requests don't grow unbounded
 
-// ---- Configurable settings (from the original spec) ----
 const CONFIG = {
-  MIN_LIQUIDITY_USD: 1000,
-  TOKEN_COOLDOWN_MINUTES: 30,
-  MAX_ALERTS_PER_HOUR: 10,
-  SCORE_WEIGHTS: {
-    NEW_POOL: 20,
-    STRONG_LIQUIDITY: 20,
-    VOLUME_ACCELERATION: 15,
-    BUYER_GROWTH: 10,
-    HOLDER_GROWTH: 10,
-    BUY_SELL_IMBALANCE: 10,
-    FOMO_SIGNAL: 5,
+  MAX_ALERTS_PER_HOUR: 40,
+  THRESHOLDS: {
+    LIQUIDITY_PCT: 0.2, // 20%
+    LIQUIDITY_MIN_USD_MOVE: 1000,
+    VOLUME_MULTIPLIER: 3, // 3x trailing average
+    VOLUME_MIN_USD: 250,
+    PRICE_PCT_5M: 15, // percent
+    PRICE_PCT_1H: 30, // percent
+    IMBALANCE_RATIO: 10, // 10:1
+    IMBALANCE_MIN_TXNS: 10,
+    FDV_TIERS: [50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000, 10_000_000],
+    DEAD_LIQUIDITY_MIN_PEAK_TO_TRACK: 500, // only track "peak" once a pool had real liquidity
+    DEAD_LIQUIDITY_PCT_OF_PEAK: 0.1, // below 10% of peak
+    DEAD_LIQUIDITY_MIN_USD: 200, // or below this absolute floor
   },
+  COOLDOWN_MINUTES: {
+    LIQUIDITY_SPIKE: 15,
+    LIQUIDITY_DRAIN: 15,
+    VOLUME_SURGE: 15,
+    PRICE_MOVE: 10,
+    IMBALANCE: 15,
+  },
+  VOLUME_HISTORY_SAMPLES: 10, // 10 samples x 3min cron = ~30min trailing baseline
 };
 
-// ---- Event definitions (human-readable — viem computes the correct topic hash for us) ----
-const V2_PAIR_CREATED = parseAbiItem(
-  "event PairCreated(address indexed token0, address indexed token1, address pair, uint256 allPairsLength)"
-);
-const V3_POOL_CREATED = parseAbiItem(
-  "event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool)"
-);
-const V4_INITIALIZE = parseAbiItem(
-  "event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)"
-);
+let subrequestCount = 0;
+let subrequestReserve = 0;
 
-// Small helper: call the RPC with any JSON-RPC method
-async function rpcCall(method, params, rpcUrl = RPC_URL) {
-  const endpoints = [...new Set([preferredRpcUrl, rpcUrl, ...RPC_FALLBACK_URLS])];
-  let lastError = null;
+// ---------------------------------------------------------------------------
+// Low-level helpers
+// ---------------------------------------------------------------------------
 
-  for (const endpoint of endpoints) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      trackSubrequest();
-      await new Promise((resolve) => setTimeout(resolve, RPC_REQUEST_SPACING_MS));
-      let res;
-      let json;
-      try {
-        res = await fetch(endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-        });
-        json = await res.json();
-      } catch (err) {
-        lastError = new Error(`RPC request failed: ${err.message}`);
-        if (attempt < 2) {
-          await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
-          continue;
-        }
-        break;
-      }
-
-      const errorMessage = String(json.error?.message || "").toLowerCase();
-      const isRateLimited =
-        res.status === 429 ||
-        json.error?.code === 429 ||
-        errorMessage.includes("rate limit") ||
-        errorMessage.includes("too many requests");
-      if (isRateLimited) {
-        lastError = new Error("RPC rate limit exceeded after 3 attempts.");
-        if (attempt < 2) {
-          await new Promise((resolve) => setTimeout(resolve, 2000 * 2 ** attempt));
-          continue;
-        }
-        break;
-      }
-
-      if (!res.ok) {
-        lastError = new Error(`RPC HTTP error: ${res.status}`);
-        break;
-      }
-      if (json.error) throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
-      preferredRpcUrl = endpoint;
-      return json.result;
-    }
-
-    if (endpoints.length > 1) {
-      console.warn(`RPC endpoint unavailable, trying fallback: ${endpoint}`);
-    }
-  }
-
-  throw lastError || new Error("RPC request failed on all configured endpoints");
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function trackSubrequest() {
@@ -135,367 +65,160 @@ function trackSubrequest() {
   subrequestCount++;
 }
 
-async function getCurrentBlock(rpcUrl) {
-  const hex = await rpcCall("eth_blockNumber", [], rpcUrl);
-  if (typeof hex !== "string" || !/^0x[0-9a-f]+$/i.test(hex)) {
-    throw new Error(`RPC returned an invalid block number: ${String(hex)}`);
-  }
-  return parseInt(hex, 16);
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+  return chunks;
 }
 
-async function getEthUsdPriceOrNull(env) {
-  const tenMinutes = 10 * 60 * 1000;
-  if (cachedEthPrice && Date.now() - cachedEthPriceTime < tenMinutes) {
-    return cachedEthPrice;
-  }
-
-  if (ethPricePromise) return ethPricePromise;
-
-  ethPricePromise = (async () => {
-    let cachedRaw = null;
-    let cached = null;
+async function fetchJson(url, { retries = 2 } = {}) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    trackSubrequest();
     try {
-      cachedRaw = await env.BOT_STATE.get("ethPriceCache");
-      if (cachedRaw) {
-        cached = JSON.parse(cachedRaw);
-        if (typeof cached.price === "number" && Number.isFinite(cached.price) && cached.price > 0) {
-          if (Date.now() - cached.time < tenMinutes) {
-            cachedEthPrice = cached.price;
-            cachedEthPriceTime = cached.time;
-            return cached.price;
-          }
-        } else {
-          cached = null;
-        }
-      }
-    } catch (err) {
-      console.error("ETH price cache read failed:", err.message);
-      cached = null;
-    }
-
-    try {
-      trackSubrequest();
-      const res = await fetch(COINGECKO_URL, {
+      const res = await fetch(url, {
         headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; RobinhoodDetectiveBot/1.0)",
           Accept: "application/json",
+          "User-Agent": "Mozilla/5.0 (compatible; RobinhoodDetectiveBot/1.0)",
         },
       });
-      if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
-      const json = await res.json();
-      const price = json?.ethereum?.usd;
-      if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) {
-        throw new Error("Unexpected CoinGecko response shape");
+      if (res.status === 429) {
+        lastError = new Error("DexScreener rate limit hit");
+        if (attempt < retries) {
+          await sleep(1000 * 2 ** attempt);
+          continue;
+        }
+        break;
       }
-      const time = Date.now();
-      await env.BOT_STATE.put("ethPriceCache", JSON.stringify({ price, time }));
-      cachedEthPrice = price;
-      cachedEthPriceTime = time;
-      return price;
+      if (!res.ok) throw new Error(`DexScreener HTTP ${res.status} for ${url}`);
+      return await res.json();
     } catch (err) {
-      console.error("CoinGecko price fetch failed, continuing without USD conversion:", err.message);
-      if (cached) {
-        console.log(`Using stale cached ETH price from ${new Date(cached.time).toISOString()}`);
-        return cached.price;
+      lastError = err;
+      if (err.message === "SUBREQUEST_BUDGET_REACHED") throw err;
+      if (attempt < retries) {
+        await sleep(500 * 2 ** attempt);
+        continue;
       }
-      return null;
     }
-  })();
-
-  const price = await ethPricePromise;
-  if (price === null) ethPricePromise = null;
-  return price;
+  }
+  throw lastError || new Error(`DexScreener request failed: ${url}`);
 }
 
-function encodeAddressParam(address) {
-  return address.toLowerCase().replace("0x", "").padStart(64, "0");
+function timeAgo(ms) {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  return `${hours}h ago`;
 }
 
-async function ethCall(to, data, rpcUrl) {
-  return rpcCall("eth_call", [{ to, data }, "latest"], rpcUrl);
+function fmtUsd(n) {
+  if (n === null || n === undefined || !Number.isFinite(n)) return "N/A";
+  return `$${n.toLocaleString(undefined, { maximumFractionDigits: n >= 1000 ? 0 : 2 })}`;
 }
 
-async function getTokenDecimalsOrDefault(tokenAddress, rpcUrl, fallback = 18) {
+function fmtPrice(n) {
+  if (n === null || n === undefined || !Number.isFinite(n)) return "N/A";
+  return n < 0.01 ? `$${n.toFixed(8).replace(/0+$/, "").replace(/\.$/, "")}` : `$${n.toFixed(4)}`;
+}
+
+// ---------------------------------------------------------------------------
+// DexScreener API calls
+// ---------------------------------------------------------------------------
+
+async function fetchLatestProfiles() {
+  const data = await fetchJson(`${DEXSCREENER_BASE}/token-profiles/latest/v1`);
+  return Array.isArray(data) ? data : [];
+}
+
+async function fetchLatestBoosts() {
+  const data = await fetchJson(`${DEXSCREENER_BASE}/token-boosts/latest/v1`);
+  return Array.isArray(data) ? data : [];
+}
+
+// Fetches all Robinhood Chain pairs for a batch of token addresses (max 30 per call).
+async function fetchPairsForTokenBatch(tokenAddresses) {
+  if (tokenAddresses.length === 0) return [];
+  const url = `${DEXSCREENER_BASE}/latest/dex/tokens/${tokenAddresses.join(",")}`;
+  const data = await fetchJson(url);
+  const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
+  return pairs.filter((p) => p.chainId === CHAIN_ID);
+}
+
+// Handles >30 addresses by chunking, and stops gracefully if the subrequest budget runs out.
+async function fetchPairsForTokens(tokenAddresses) {
+  const results = [];
+  for (const chunk of chunkArray(tokenAddresses, MAX_ADDRESSES_PER_CALL)) {
+    try {
+      const pairs = await fetchPairsForTokenBatch(chunk);
+      results.push(...pairs);
+    } catch (err) {
+      if (err.message === "SUBREQUEST_BUDGET_REACHED") break;
+      console.error("fetchPairsForTokens chunk failed:", err.message);
+    }
+  }
+  return results;
+}
+
+function pickPrimaryPair(pairs) {
+  if (pairs.length === 0) return null;
+  return pairs.reduce((best, p) => {
+    const liq = p.liquidity?.usd ?? 0;
+    const bestLiq = best?.liquidity?.usd ?? -1;
+    return liq > bestLiq ? p : best;
+  }, null);
+}
+
+// ---------------------------------------------------------------------------
+// KV state helpers
+// ---------------------------------------------------------------------------
+
+async function getWatchlist(env) {
+  const raw = await env.BOT_STATE.get("watchlist");
+  if (!raw) return [];
   try {
-    const raw = await ethCall(tokenAddress, DECIMALS_SELECTOR, rpcUrl);
-    if (typeof raw === "string" && /^0x[0-9a-f]+$/i.test(raw)) {
-      const decimals = Number(BigInt(raw));
-      if (Number.isInteger(decimals) && decimals >= 0 && decimals <= 36) return decimals;
-    }
-  } catch (err) {
-    console.error(`decimals() lookup failed for ${tokenAddress}, assuming ${fallback}:`, err.message);
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
   }
-  return fallback;
 }
 
-async function getTokenText(tokenAddress, selector, rpcUrl) {
+async function saveWatchlist(env, list) {
+  const trimmed = list.length > WATCHLIST_MAX_TOKENS ? list.slice(list.length - WATCHLIST_MAX_TOKENS) : list;
+  await env.BOT_STATE.put("watchlist", JSON.stringify(trimmed));
+}
+
+async function getPairState(env, pairAddress) {
+  const raw = await env.BOT_STATE.get(`pair:${pairAddress.toLowerCase()}`);
+  if (!raw) return null;
   try {
-    const raw = await ethCall(tokenAddress, selector, rpcUrl);
-    if (typeof raw === "string" && /^0x[0-9a-f]+$/i.test(raw)) {
-      return decodeAbiParameters([{ type: "string" }], raw)[0];
-    }
-  } catch (err) {
-    console.error(`Token metadata lookup failed for ${tokenAddress}:`, err.message);
+    return JSON.parse(raw);
+  } catch {
+    return null;
   }
-  return null;
 }
 
-async function getTokenMetadata(tokenAddress, rpcUrl) {
-  const name = await getTokenText(tokenAddress, NAME_SELECTOR, rpcUrl);
-  const symbol = await getTokenText(tokenAddress, SYMBOL_SELECTOR, rpcUrl);
-  const decimals = await getTokenDecimalsOrDefault(tokenAddress, rpcUrl, null);
-  return { name, symbol, decimals };
+async function savePairState(env, pairAddress, state) {
+  await env.BOT_STATE.put(`pair:${pairAddress.toLowerCase()}`, JSON.stringify(state));
 }
 
-function getNonWethTokenForFinding(finding) {
-  const token0 = finding.token0 || finding.currency0;
-  const token1 = finding.token1 || finding.currency1;
-  return token0?.toLowerCase() === WETH_ADDRESS.toLowerCase() ? token1 : token0;
+async function isKnown(env, key) {
+  return (await env.BOT_STATE.get(key)) !== null;
 }
 
-async function getTokenBalance(tokenAddress, account, rpcUrl) {
-  const raw = await ethCall(
-    tokenAddress,
-    `${BALANCE_OF_SELECTOR}${encodeAddressParam(account)}`,
-    rpcUrl
-  );
-  if (typeof raw !== "string" || !/^0x[0-9a-f]+$/i.test(raw)) {
-    throw new Error(`Invalid balanceOf response for ${tokenAddress}`);
-  }
-  return BigInt(raw);
+async function markKnown(env, key, ttlSeconds) {
+  await env.BOT_STATE.put(key, "1", ttlSeconds ? { expirationTtl: ttlSeconds } : undefined);
 }
 
-function getPoolStateSlot(poolId) {
-  return keccak256(encodePacked(["bytes32", "uint256"], [poolId, POOLS_SLOT]));
+async function isOnCooldown(env, alertKind, pairAddress) {
+  return (await env.BOT_STATE.get(`cooldown:${alertKind}:${pairAddress.toLowerCase()}`)) !== null;
 }
 
-async function getV4Liquidity(poolId, rpcUrl) {
-  const stateSlot = getPoolStateSlot(poolId);
-  const liquiditySlotNumber = BigInt(stateSlot) + LIQUIDITY_OFFSET;
-  const liquiditySlot = `0x${liquiditySlotNumber.toString(16).padStart(64, "0")}`;
-  const raw = await ethCall(
-    UNISWAP_V4_POOL_MANAGER,
-    `${EXTSLOAD_SELECTOR}${liquiditySlot.slice(2)}`,
-    rpcUrl
-  );
-  if (typeof raw !== "string" || !/^0x[0-9a-f]{64}$/i.test(raw)) {
-    throw new Error("Invalid V4 liquidity storage response");
-  }
-  return BigInt(raw);
-}
-
-async function getPoolLiquidity(finding, rpcUrl, env) {
-  if (finding.source === "Uniswap V2") {
-    const raw = await ethCall(finding.pair, GET_RESERVES_SELECTOR, rpcUrl);
-    if (typeof raw !== "string" || !/^0x[0-9a-f]+$/i.test(raw) || raw.length < 194) {
-      throw new Error("Invalid getReserves response");
-    }
-
-    const reserve0 = BigInt(`0x${raw.slice(2, 66)}`);
-    const reserve1 = BigInt(`0x${raw.slice(66, 130)}`);
-    const token0IsWeth = finding.token0.toLowerCase() === WETH_ADDRESS.toLowerCase();
-    const token1IsWeth = finding.token1.toLowerCase() === WETH_ADDRESS.toLowerCase();
-
-    if (!token0IsWeth && !token1IsWeth) {
-      if (reserve0 === 0n && reserve1 === 0n) {
-        const tokenMetadata = await getTokenMetadata(getNonWethTokenForFinding(finding), rpcUrl);
-        return {
-          pairedWithWeth: false,
-          token0Amount: 0,
-          token1Amount: 0,
-          ...tokenMetadata,
-          zeroLiquidity: true,
-          note: "Non-WETH pair - zero liquidity",
-        };
-      }
-      const decimals0 = await getTokenDecimalsOrDefault(finding.token0, rpcUrl);
-      const decimals1 = await getTokenDecimalsOrDefault(finding.token1, rpcUrl);
-      return {
-        pairedWithWeth: false,
-        token0Amount: Number(reserve0) / 10 ** decimals0,
-        token1Amount: Number(reserve1) / 10 ** decimals1,
-        zeroLiquidity: reserve0 === 0n && reserve1 === 0n,
-        note: "Non-WETH pair - token amounts shown, no USD figure",
-      };
-    }
-
-    const ethPrice = await getEthUsdPriceOrNull(env);
-    const wethAmount = Number(token0IsWeth ? reserve0 : reserve1) / 1e18;
-    return {
-      pairedWithWeth: true,
-      wethAmount,
-      usd: ethPrice === null ? null : wethAmount * ethPrice,
-      zeroLiquidity: (token0IsWeth ? reserve0 : reserve1) === 0n,
-      ...(ethPrice === null ? { note: "WETH price unavailable this run" } : {}),
-    };
-  }
-
-  if (finding.source === "Uniswap V3") {
-    const token0IsWeth = finding.token0.toLowerCase() === WETH_ADDRESS.toLowerCase();
-    const token1IsWeth = finding.token1.toLowerCase() === WETH_ADDRESS.toLowerCase();
-
-    if (!token0IsWeth && !token1IsWeth) {
-      const [balance0, balance1] = await Promise.all([
-        getTokenBalance(finding.token0, finding.pool, rpcUrl),
-        getTokenBalance(finding.token1, finding.pool, rpcUrl),
-      ]);
-      if (balance0 === 0n && balance1 === 0n) {
-        const tokenMetadata = await getTokenMetadata(getNonWethTokenForFinding(finding), rpcUrl);
-        return {
-          pairedWithWeth: false,
-          token0Amount: 0,
-          token1Amount: 0,
-          ...tokenMetadata,
-          zeroLiquidity: true,
-          note: "Non-WETH pair - zero liquidity",
-        };
-      }
-      const [decimals0, decimals1] = await Promise.all([
-        getTokenDecimalsOrDefault(finding.token0, rpcUrl),
-        getTokenDecimalsOrDefault(finding.token1, rpcUrl),
-      ]);
-      return {
-        pairedWithWeth: false,
-        token0Amount: Number(balance0) / 10 ** decimals0,
-        token1Amount: Number(balance1) / 10 ** decimals1,
-        zeroLiquidity: balance0 === 0n && balance1 === 0n,
-        note: "Non-WETH pair - token amounts shown, no USD figure",
-      };
-    }
-
-    const wethRaw = await getTokenBalance(WETH_ADDRESS, finding.pool, rpcUrl);
-    const ethPrice = await getEthUsdPriceOrNull(env);
-    const wethAmount = Number(wethRaw) / 1e18;
-    return {
-      pairedWithWeth: true,
-      wethAmount,
-      usd: ethPrice === null ? null : wethAmount * ethPrice,
-      zeroLiquidity: wethRaw === 0n,
-      ...(ethPrice === null ? { note: "WETH price unavailable this run" } : {}),
-    };
-  }
-
-  const poolId = finding.id;
-  if (typeof poolId !== "string" || !/^0x[0-9a-f]{64}$/i.test(poolId)) {
-    return { pairedWithWeth: null, note: "N/A - invalid V4 pool id" };
-  }
-
-  let liquidity;
-  try {
-    liquidity = await getV4Liquidity(poolId, rpcUrl);
-  } catch (err) {
-    return { pairedWithWeth: null, note: `N/A - V4 liquidity read failed: ${err.message}` };
-  }
-
-  const sqrtPriceX96 = BigInt(finding.sqrtPriceX96);
-  const currency0 = finding.currency0;
-  const currency1 = finding.currency1;
-  const token0IsWeth = currency0.toLowerCase() === WETH_ADDRESS.toLowerCase();
-  const token1IsWeth = currency1.toLowerCase() === WETH_ADDRESS.toLowerCase();
-  const tokenMetadata =
-    liquidity === 0n || token0IsWeth || token1IsWeth
-      ? await getTokenMetadata(getNonWethTokenForFinding(finding), rpcUrl)
-      : {};
-
-  if (liquidity === 0n || sqrtPriceX96 === 0n) {
-    return {
-      pairedWithWeth: token0IsWeth || token1IsWeth,
-      usd: token0IsWeth || token1IsWeth ? 0 : null,
-      ...tokenMetadata,
-      zeroLiquidity: true,
-      note: "V4 pool not yet funded (zero liquidity)",
-    };
-  }
-
-  const virtualReserve0 = (liquidity * Q96) / sqrtPriceX96;
-  const virtualReserve1 = (liquidity * sqrtPriceX96) / Q96;
-
-  if (!token0IsWeth && !token1IsWeth) {
-    const [decimals0, decimals1] = await Promise.all([
-      getTokenDecimalsOrDefault(currency0, rpcUrl),
-      getTokenDecimalsOrDefault(currency1, rpcUrl),
-    ]);
-    return {
-      pairedWithWeth: false,
-      estimated: true,
-      ...tokenMetadata,
-      zeroLiquidity: false,
-      token0Amount: Number(virtualReserve0) / 10 ** decimals0,
-      token1Amount: Number(virtualReserve1) / 10 ** decimals1,
-      note: "Non-WETH V4 pair - estimated token amounts, no USD figure",
-    };
-  }
-
-  const wethRaw = token0IsWeth ? virtualReserve0 : virtualReserve1;
-  const wethAmount = Number(wethRaw) / 1e18;
-  const ethPrice = await getEthUsdPriceOrNull(env);
-  return {
-    pairedWithWeth: true,
-    estimated: true,
-    ...tokenMetadata,
-    zeroLiquidity: false,
-    wethAmount,
-    usd: ethPrice === null ? null : wethAmount * ethPrice,
-    note: ethPrice === null ? "WETH price unavailable this run" : "Estimated from active-tick liquidity (V4)",
-  };
-}
-
-function computeSignalScore(finding, liquidity) {
-  const weights = CONFIG.SCORE_WEIGHTS;
-  let score = weights.NEW_POOL;
-  const reasons = ["New DEX pool"];
-
-  if (liquidity.pairedWithWeth && liquidity.usd !== null && liquidity.usd >= CONFIG.MIN_LIQUIDITY_USD) {
-    score += weights.STRONG_LIQUIDITY;
-    reasons.push("Strong initial liquidity");
-  }
-
-  return {
-    score,
-    maxPossibleRightNow: weights.NEW_POOL + weights.STRONG_LIQUIDITY,
-    reasons,
-  };
-}
-
-function passesFilter(finding, liquidity) {
-  if (liquidity.pairedWithWeth !== true || liquidity.usd === null) {
-    return { passes: false, reason: liquidity.note || "No verifiable USD liquidity yet" };
-  }
-  if (liquidity.usd < CONFIG.MIN_LIQUIDITY_USD) {
-    return {
-      passes: false,
-      reason: `Liquidity $${liquidity.usd.toFixed(0)} below $${CONFIG.MIN_LIQUIDITY_USD} minimum`,
-    };
-  }
-  return { passes: true, reason: "Meets liquidity threshold" };
-}
-
-function getNonWethTokenAddress(finding) {
-  const token0 = (finding.token0 || finding.currency0 || "").toLowerCase();
-  const token1 = (finding.token1 || finding.currency1 || "").toLowerCase();
-  const weth = WETH_ADDRESS.toLowerCase();
-  if (token0 && token0 !== weth) return token0;
-  if (token1 && token1 !== weth) return token1;
-  return token0 || token1 || "unknown";
-}
-
-async function isDuplicate(env, finding) {
-  return (await env.BOT_STATE.get(`alerted:${finding.alertKind || "THRESHOLD"}:${finding.txHash}`)) !== null;
-}
-
-async function markAlerted(env, finding) {
-  await env.BOT_STATE.put(`alerted:${finding.alertKind || "THRESHOLD"}:${finding.txHash}`, "1", {
-    expirationTtl: 24 * 60 * 60,
-  });
-}
-
-async function isOnCooldown(env, tokenAddress) {
-  return (await env.BOT_STATE.get(`cooldown:${tokenAddress}`)) !== null;
-}
-
-async function startCooldown(env, tokenAddress) {
-  await env.BOT_STATE.put(`cooldown:${tokenAddress}`, "1", {
-    expirationTtl: CONFIG.TOKEN_COOLDOWN_MINUTES * 60,
+async function startCooldown(env, alertKind, pairAddress, minutes) {
+  await env.BOT_STATE.put(`cooldown:${alertKind}:${pairAddress.toLowerCase()}`, "1", {
+    expirationTtl: minutes * 60,
   });
 }
 
@@ -508,119 +231,423 @@ async function isUnderHourlyCap(env) {
 async function incrementHourlyCap(env) {
   const countStr = await env.BOT_STATE.get("hourlyAlertCount");
   const count = countStr ? Number.parseInt(countStr, 10) : 0;
-  const nextCount = Number.isSafeInteger(count) && count >= 0 ? count + 1 : 1;
-  await env.BOT_STATE.put("hourlyAlertCount", nextCount.toString(), { expirationTtl: 60 * 60 });
+  const next = Number.isSafeInteger(count) && count >= 0 ? count + 1 : 1;
+  await env.BOT_STATE.put("hourlyAlertCount", next.toString(), { expirationTtl: 60 * 60 });
 }
 
-function getPendingPoolKey(finding) {
-  return `pendingPool:${finding.source}:${finding.txHash}`;
-}
+// ---------------------------------------------------------------------------
+// Feature 1 — New Pair discovery (via token-profiles/latest/v1)
+// ---------------------------------------------------------------------------
 
-function serializePendingFinding(finding) {
-  return JSON.stringify({
-    source: finding.source,
-    type: finding.type,
-    txHash: finding.txHash,
-    token0: finding.token0,
-    token1: finding.token1,
-    pair: finding.pair,
-    pool: finding.pool,
-    id: finding.id,
-    currency0: finding.currency0,
-    currency1: finding.currency1,
-    sqrtPriceX96: finding.sqrtPriceX96?.toString(),
-  });
-}
+async function discoverNewPairs(env, polledAt) {
+  const alerts = [];
+  let profiles;
+  try {
+    profiles = await fetchLatestProfiles();
+  } catch (err) {
+    console.error("Profile discovery failed:", err.message);
+    return alerts;
+  }
 
-async function rememberPendingPool(env, finding) {
-  await env.BOT_STATE.put(getPendingPoolKey(finding), serializePendingFinding(finding), {
-    expirationTtl: PENDING_POOL_TTL_SECONDS,
-  });
-}
-
-async function getPendingPoolFindings(env) {
-  const listed = await env.BOT_STATE.list({ prefix: "pendingPool:", limit: MAX_PENDING_POOL_CHECKS_PER_RUN });
-  const findings = [];
-  for (const key of listed.keys) {
-    const stored = await env.BOT_STATE.get(key.name);
-    if (!stored) continue;
-    try {
-      findings.push(JSON.parse(stored));
-    } catch (err) {
-      console.error(`Invalid pending pool record ${key.name}:`, err.message);
+  const chainTokens = profiles.filter((p) => p.chainId === CHAIN_ID).map((p) => p.tokenAddress);
+  const unseenTokens = [];
+  for (const tokenAddress of chainTokens) {
+    if (unseenTokens.length >= MAX_NEW_TOKENS_PER_RUN) break;
+    if (!(await isKnown(env, `knownToken:${tokenAddress.toLowerCase()}`))) {
+      unseenTokens.push(tokenAddress);
     }
   }
-  return findings;
+  if (unseenTokens.length === 0) return alerts;
+
+  let pairs;
+  try {
+    pairs = await fetchPairsForTokens(unseenTokens);
+  } catch (err) {
+    console.error("Fetching pairs for new tokens failed:", err.message);
+    return alerts;
+  }
+
+  const watchlist = await getWatchlist(env);
+  const watchlistTokens = new Set(watchlist.map((w) => w.tokenAddress.toLowerCase()));
+
+  for (const tokenAddress of unseenTokens) {
+    const tokenPairs = pairs.filter(
+      (p) => p.baseToken?.address?.toLowerCase() === tokenAddress.toLowerCase()
+    );
+    const primary = pickPrimaryPair(tokenPairs);
+
+    // Mark known regardless of whether a pair exists yet, so we don't re-check every run.
+    await markKnown(env, `knownToken:${tokenAddress.toLowerCase()}`, 30 * 24 * 60 * 60);
+
+    if (!primary) continue; // profile exists but no live Robinhood Chain pair yet
+
+    alerts.push({ kind: "NEW_PAIR", pair: primary, polledAt });
+
+    if (!watchlistTokens.has(tokenAddress.toLowerCase())) {
+      watchlist.push({ tokenAddress, pairAddress: primary.pairAddress, addedAt: polledAt });
+      watchlistTokens.add(tokenAddress.toLowerCase());
+    }
+
+    await savePairState(env, primary.pairAddress, snapshotFromPair(primary, polledAt, null));
+  }
+
+  await saveWatchlist(env, watchlist);
+  return alerts;
 }
 
-async function checkPendingPools(env, rpcUrl) {
-  const findings = [];
-  for (const finding of await getPendingPoolFindings(env)) {
-    try {
-      const liquidity = await getPoolLiquidity(finding, rpcUrl, env);
-      if (liquidity.zeroLiquidity) continue;
-      const tokenMetadata = await getTokenMetadata(getNonWethTokenForFinding(finding), rpcUrl);
-      findings.push({
-        ...finding,
-        alertKind: "LIQUIDITY_ADDED",
-        liquidity: { ...liquidity, ...tokenMetadata },
-        filterResult: { passes: true, reason: "Liquidity added to tracked pool" },
-        signal: computeSignalScore(finding, liquidity),
+// ---------------------------------------------------------------------------
+// Feature 6 — Newly boosted tokens (via token-boosts/latest/v1)
+// ---------------------------------------------------------------------------
+
+async function discoverBoosts(env, polledAt) {
+  const alerts = [];
+  let boosts;
+  try {
+    boosts = await fetchLatestBoosts();
+  } catch (err) {
+    console.error("Boost discovery failed:", err.message);
+    return alerts;
+  }
+
+  const chainBoosts = boosts.filter((b) => b.chainId === CHAIN_ID);
+  const unseen = [];
+  for (const b of chainBoosts) {
+    if (!(await isKnown(env, `knownBoost:${b.tokenAddress.toLowerCase()}`))) unseen.push(b);
+  }
+  if (unseen.length === 0) return alerts;
+
+  let pairs;
+  try {
+    pairs = await fetchPairsForTokens(unseen.map((b) => b.tokenAddress));
+  } catch (err) {
+    console.error("Fetching pairs for boosted tokens failed:", err.message);
+    pairs = [];
+  }
+
+  for (const boost of unseen) {
+    await markKnown(env, `knownBoost:${boost.tokenAddress.toLowerCase()}`, 30 * 24 * 60 * 60);
+    const tokenPairs = pairs.filter(
+      (p) => p.baseToken?.address?.toLowerCase() === boost.tokenAddress.toLowerCase()
+    );
+    const primary = pickPrimaryPair(tokenPairs);
+    if (!primary) continue; // boosted but no live pair on this chain yet
+    alerts.push({ kind: "BOOSTED", pair: primary, boost, polledAt });
+  }
+
+  return alerts;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot + per-pair evaluation (Features 2, 3, 4, 5, 7, 8)
+// ---------------------------------------------------------------------------
+
+function snapshotFromPair(pair, polledAt, prevState) {
+  const liquidityUsd = pair.liquidity?.usd ?? null;
+  const volumeM5 = pair.volume?.m5 ?? 0;
+  const volumeHistory = prevState?.volumeHistory ? [...prevState.volumeHistory] : [];
+  volumeHistory.push(volumeM5);
+  while (volumeHistory.length > CONFIG.VOLUME_HISTORY_SAMPLES) volumeHistory.shift();
+
+  const priorPeak = prevState?.peakLiquidityUsd ?? 0;
+  const peakLiquidityUsd =
+    liquidityUsd !== null && liquidityUsd >= CONFIG.THRESHOLDS.DEAD_LIQUIDITY_MIN_PEAK_TO_TRACK
+      ? Math.max(priorPeak, liquidityUsd)
+      : priorPeak;
+
+  return {
+    symbol: pair.baseToken?.symbol ?? "?",
+    name: pair.baseToken?.name ?? "Unknown token",
+    tokenAddress: pair.baseToken?.address,
+    dexId: pair.dexId,
+    url: pair.url,
+    liquidityUsd,
+    volumeHistory,
+    priceUsd: pair.priceUsd ? Number(pair.priceUsd) : null,
+    peakLiquidityUsd,
+    lastFdvTier: prevState?.lastFdvTier ?? 0,
+    isDead: prevState?.isDead ?? false,
+    polledAt,
+  };
+}
+
+function evaluatePair(pair, prevState, polledAt) {
+  const alerts = [];
+  const pairAddress = pair.pairAddress;
+  const liquidityUsd = pair.liquidity?.usd ?? null;
+
+  // --- Feature 2: Liquidity spike / drain ---
+  if (prevState && prevState.liquidityUsd && liquidityUsd !== null && prevState.liquidityUsd > 0) {
+    const pctChange = (liquidityUsd - prevState.liquidityUsd) / prevState.liquidityUsd;
+    const absMove = Math.abs(liquidityUsd - prevState.liquidityUsd);
+    if (Math.abs(pctChange) >= CONFIG.THRESHOLDS.LIQUIDITY_PCT && absMove >= CONFIG.THRESHOLDS.LIQUIDITY_MIN_USD_MOVE) {
+      alerts.push({
+        kind: pctChange > 0 ? "LIQUIDITY_SPIKE" : "LIQUIDITY_DRAIN",
+        pair,
+        prevLiquidityUsd: prevState.liquidityUsd,
+        pctChange,
+        polledAt,
       });
-      await env.BOT_STATE.delete(getPendingPoolKey(finding));
-    } catch (err) {
-      if (err.message === "SUBREQUEST_BUDGET_REACHED") break;
-      console.error(`Pending pool check failed for ${finding.txHash}:`, err.message);
     }
   }
-  return findings;
+
+  // --- Feature 3: Volume surge ---
+  if (prevState && prevState.volumeHistory && prevState.volumeHistory.length >= 2) {
+    const baseline =
+      prevState.volumeHistory.reduce((a, b) => a + b, 0) / prevState.volumeHistory.length;
+    const volumeM5 = pair.volume?.m5 ?? 0;
+    if (baseline > 0 && volumeM5 >= baseline * CONFIG.THRESHOLDS.VOLUME_MULTIPLIER && volumeM5 >= CONFIG.THRESHOLDS.VOLUME_MIN_USD) {
+      alerts.push({
+        kind: "VOLUME_SURGE",
+        pair,
+        baseline,
+        multiplier: volumeM5 / baseline,
+        polledAt,
+      });
+    }
+  }
+
+  // --- Feature 4: Price move (DexScreener already computes these windows) ---
+  const change5m = pair.priceChange?.m5;
+  const change1h = pair.priceChange?.h1;
+  if (typeof change5m === "number" && Math.abs(change5m) >= CONFIG.THRESHOLDS.PRICE_PCT_5M) {
+    alerts.push({ kind: change5m > 0 ? "PRICE_PUMP" : "PRICE_DUMP", pair, pct: change5m, window: "5 min", polledAt });
+  } else if (typeof change1h === "number" && Math.abs(change1h) >= CONFIG.THRESHOLDS.PRICE_PCT_1H) {
+    alerts.push({ kind: change1h > 0 ? "PRICE_PUMP" : "PRICE_DUMP", pair, pct: change1h, window: "1h", polledAt });
+  }
+
+  // --- Feature 5: Buy/sell imbalance ---
+  const buys = pair.txns?.m5?.buys ?? 0;
+  const sells = pair.txns?.m5?.sells ?? 0;
+  const totalTxns = buys + sells;
+  if (totalTxns >= CONFIG.THRESHOLDS.IMBALANCE_MIN_TXNS) {
+    if (buys >= sells * CONFIG.THRESHOLDS.IMBALANCE_RATIO) {
+      alerts.push({ kind: "IMBALANCE_BUY", pair, buys, sells, polledAt });
+    } else if (sells >= buys * CONFIG.THRESHOLDS.IMBALANCE_RATIO) {
+      alerts.push({ kind: "IMBALANCE_SELL", pair, buys, sells, polledAt });
+    }
+  }
+
+  // --- Feature 7: FDV / market cap milestone ---
+  const capValue = pair.marketCap ?? pair.fdv ?? null;
+  const lastTier = prevState?.lastFdvTier ?? 0;
+  let newTier = lastTier;
+  if (capValue !== null) {
+    for (const tier of CONFIG.THRESHOLDS.FDV_TIERS) {
+      if (capValue >= tier && tier > lastTier) newTier = tier;
+    }
+    if (newTier > lastTier) {
+      alerts.push({ kind: "MILESTONE", pair, tier: newTier, fdv: pair.fdv, marketCap: pair.marketCap, polledAt });
+    }
+  }
+
+  // --- Feature 8: Dead / rugged tracker ---
+  const peak = prevState?.peakLiquidityUsd ?? 0;
+  const wasDead = prevState?.isDead ?? false;
+  let isDead = wasDead;
+  if (
+    !wasDead &&
+    peak >= CONFIG.THRESHOLDS.DEAD_LIQUIDITY_MIN_PEAK_TO_TRACK &&
+    liquidityUsd !== null &&
+    (liquidityUsd < peak * CONFIG.THRESHOLDS.DEAD_LIQUIDITY_PCT_OF_PEAK ||
+      liquidityUsd < CONFIG.THRESHOLDS.DEAD_LIQUIDITY_MIN_USD)
+  ) {
+    isDead = true;
+    alerts.push({ kind: "DEAD", pair, peakLiquidityUsd: peak, currentLiquidityUsd: liquidityUsd, polledAt });
+  }
+
+  const nextState = snapshotFromPair(pair, polledAt, prevState);
+  nextState.lastFdvTier = newTier;
+  nextState.isDead = isDead;
+
+  return { alerts, nextState, pairAddress };
 }
 
-function formatAlertMessage(finding) {
-  const tokenAddress = getNonWethTokenAddress(finding);
-  const liquidity = finding.liquidity;
-  const tokenLabel = liquidity.symbol || liquidity.name
-    ? `${liquidity.name || "Unknown token"} (${liquidity.symbol || "?"})`
-    : "Unknown token";
-  const tokenDetails = [
-    `Token: ${tokenLabel}`,
-    `Decimals: ${liquidity.decimals ?? "unknown"}`,
-    `Contract: \`${tokenAddress}\``,
-  ];
-  const title =
-    finding.alertKind === "ZERO_LIQUIDITY_LAUNCH"
-      ? "NEW TOKEN/POOL LAUNCH (ZERO LIQUIDITY)"
-      : finding.alertKind === "LIQUIDITY_ADDED"
-      ? "LIQUIDITY ADDED TO TRACKED POOL"
-      : "NEW ROBINHOOD ACTIVITY";
-  const liquidityLine =
-    liquidity.pairedWithWeth === true && liquidity.usd !== null
-      ? `Liquidity: $${liquidity.usd.toLocaleString(undefined, { maximumFractionDigits: 0 })}${liquidity.estimated ? " (estimated)" : ""}`
-      : liquidity.pairedWithWeth === true
-      ? `Liquidity: ${liquidity.wethAmount.toFixed(3)} WETH (USD price unavailable)`
-      : liquidity.pairedWithWeth === false
-      ? `Liquidity: ${liquidity.token0Amount?.toLocaleString(undefined, { maximumFractionDigits: 2 })} / ${liquidity.token1Amount?.toLocaleString(undefined, { maximumFractionDigits: 2 })} (non-WETH pair, no USD)`
-      : `Liquidity: N/A (${liquidity.note})`;
+async function pollWatchlist(env, polledAt) {
+  const watchlist = await getWatchlist(env);
+  if (watchlist.length === 0) return [];
 
-  return [
-    title,
-    "",
-    ...tokenDetails,
-    "Robinhood Chain",
-    `DEX: ${finding.source}`,
-    liquidityLine,
-    "",
-    `Signal: ${finding.signal.score}/${finding.signal.maxPossibleRightNow}`,
-    `Why it triggered: ${finding.signal.reasons.map((reason) => `- ${reason}`).join("\n")}`,
-    "",
-    `Explorer: https://robinhoodchain.blockscout.com/address/${tokenAddress}`,
-    "",
-    "DYOR. Not financial advice. Independent bot, not affiliated with Robinhood.",
-  ].join("\n");
+  const tokenAddresses = [...new Set(watchlist.map((w) => w.tokenAddress))];
+  let pairs;
+  try {
+    pairs = await fetchPairsForTokens(tokenAddresses);
+  } catch (err) {
+    console.error("Watchlist poll failed:", err.message);
+    return [];
+  }
+
+  const pairsByAddress = new Map(pairs.map((p) => [p.pairAddress.toLowerCase(), p]));
+  const alerts = [];
+
+  for (const entry of watchlist) {
+    const pair = pairsByAddress.get(entry.pairAddress.toLowerCase());
+    if (!pair) continue; // pair may no longer be returned (delisted / no liquidity)
+
+    const prevState = await getPairState(env, entry.pairAddress);
+    const { alerts: pairAlerts, nextState } = evaluatePair(pair, prevState, polledAt);
+    alerts.push(...pairAlerts);
+    await savePairState(env, entry.pairAddress, nextState);
+  }
+
+  return alerts;
 }
+
+// ---------------------------------------------------------------------------
+// Alert formatting (Telegram Markdown) — matches the approved sample set
+// ---------------------------------------------------------------------------
+
+const SHORT_FOOTER = "🕵️‍♂️ Robinhood Detective";
+const FULL_FOOTER = "🕵️‍♂️ Robinhood Detective | unofficial, not affiliated with Robinhood";
+
+function dataAgeLine(polledAt) {
+  return `⏱ data as of ${timeAgo(Date.now() - polledAt)}`;
+}
+
+function formatAlertMessage(alert) {
+  const { kind, pair, polledAt } = alert;
+  const symbol = pair.baseToken?.symbol ?? "?";
+  const name = pair.baseToken?.name ?? "Unknown token";
+  const tokenAddress = pair.baseToken?.address ?? "unknown";
+  const liquidityUsd = pair.liquidity?.usd ?? null;
+
+  switch (kind) {
+    case "NEW_PAIR": {
+      const createdAgo = pair.pairCreatedAt ? timeAgo(Date.now() - pair.pairCreatedAt) : "unknown";
+      return [
+        "🆕 NEW PAIR — Robinhood Chain",
+        "",
+        `Token: $${symbol} (${name})`,
+        `Pair: ${symbol}/${pair.quoteToken?.symbol ?? "?"} on ${pair.dexId ?? "unknown DEX"}`,
+        `Liquidity: ${fmtUsd(liquidityUsd)}`,
+        `Created: ${createdAgo}`,
+        "",
+        `CA: \`${tokenAddress}\``,
+        `📊 ${pair.url}`,
+        dataAgeLine(polledAt),
+        "",
+        FULL_FOOTER,
+      ].join("\n");
+    }
+
+    case "LIQUIDITY_SPIKE":
+    case "LIQUIDITY_DRAIN": {
+      const isSpike = kind === "LIQUIDITY_SPIKE";
+      const pctStr = `${isSpike ? "+" : ""}${(alert.pctChange * 100).toFixed(0)}%`;
+      return [
+        `${isSpike ? "💧 LIQUIDITY SURGE" : "🩸 LIQUIDITY DRAIN"} — $${symbol}`,
+        "",
+        `${pctStr} liquidity in the last poll`,
+        `${fmtUsd(alert.prevLiquidityUsd)} → ${fmtUsd(liquidityUsd)}`,
+        ...(isSpike ? [] : ["⚠️ Possible LP pull — DYOR"]),
+        "",
+        `📊 ${pair.url}`,
+        dataAgeLine(polledAt),
+        SHORT_FOOTER,
+      ].join("\n");
+    }
+
+    case "VOLUME_SURGE": {
+      const buys = pair.txns?.m5?.buys ?? 0;
+      const sells = pair.txns?.m5?.sells ?? 0;
+      return [
+        `📈 VOLUME SURGE — $${symbol}`,
+        "",
+        `5min volume: ${fmtUsd(pair.volume?.m5)} (${alert.multiplier.toFixed(1)}x trailing avg)`,
+        `Buys: ${buys} · Sells: ${sells}`,
+        "",
+        `📊 ${pair.url}`,
+        dataAgeLine(polledAt),
+        SHORT_FOOTER,
+      ].join("\n");
+    }
+
+    case "PRICE_PUMP":
+    case "PRICE_DUMP": {
+      const isPump = kind === "PRICE_PUMP";
+      return [
+        `${isPump ? "🚀 PRICE PUMP" : "📉 PRICE DUMP"} — $${symbol}`,
+        "",
+        `${isPump ? "+" : ""}${alert.pct.toFixed(0)}% in ${alert.window}`,
+        `Current price: ${fmtPrice(pair.priceUsd ? Number(pair.priceUsd) : null)}`,
+        "",
+        `📊 ${pair.url}`,
+        dataAgeLine(polledAt),
+        SHORT_FOOTER,
+      ].join("\n");
+    }
+
+    case "IMBALANCE_BUY":
+    case "IMBALANCE_SELL": {
+      const isBuy = kind === "IMBALANCE_BUY";
+      return [
+        `⚖️ ${isBuy ? "BUY" : "SELL"} IMBALANCE — $${symbol}`,
+        "",
+        `${alert.buys} buys vs ${alert.sells} sells (5min)`,
+        `Heavy one-sided flow — ${isBuy ? "early momentum or wash pattern" : "possible exit pressure"}`,
+        "",
+        `📊 ${pair.url}`,
+        dataAgeLine(polledAt),
+        SHORT_FOOTER,
+      ].join("\n");
+    }
+
+    case "BOOSTED": {
+      return [
+        `🚀 TOKEN BOOSTED — $${symbol}`,
+        "",
+        "Just purchased a DexScreener boost",
+        `Boost amount: ${alert.boost?.amount ?? "unknown"}`,
+        "",
+        `📊 ${pair.url}`,
+        dataAgeLine(polledAt),
+        SHORT_FOOTER,
+      ].join("\n");
+    }
+
+    case "MILESTONE": {
+      return [
+        `🎯 MILESTONE — $${symbol}`,
+        "",
+        `Market cap crossed ${fmtUsd(alert.tier)}`,
+        `Current FDV: ${fmtUsd(alert.fdv)}`,
+        "",
+        `📊 ${pair.url}`,
+        dataAgeLine(polledAt),
+        SHORT_FOOTER,
+      ].join("\n");
+    }
+
+    case "DEAD": {
+      return [
+        `☠️ LIQUIDITY COLLAPSE — $${symbol}`,
+        "",
+        `Liquidity down to ${fmtUsd(alert.currentLiquidityUsd)} (was ${fmtUsd(alert.peakLiquidityUsd)} peak)`,
+        "Token likely dead or rugged",
+        "",
+        `📊 ${pair.url}`,
+        dataAgeLine(polledAt),
+        SHORT_FOOTER,
+      ].join("\n");
+    }
+
+    default:
+      return `Unrecognized alert kind: ${kind}\n📊 ${pair.url}\n${SHORT_FOOTER}`;
+  }
+}
+
+function cooldownKindFor(alertKind) {
+  if (alertKind === "LIQUIDITY_SPIKE" || alertKind === "LIQUIDITY_DRAIN") return alertKind;
+  if (alertKind === "VOLUME_SURGE") return "VOLUME_SURGE";
+  if (alertKind === "PRICE_PUMP" || alertKind === "PRICE_DUMP") return "PRICE_MOVE";
+  if (alertKind === "IMBALANCE_BUY" || alertKind === "IMBALANCE_SELL") return "IMBALANCE";
+  return null; // NEW_PAIR, BOOSTED, MILESTONE, DEAD fire at most once — no cooldown needed
+}
+
+// ---------------------------------------------------------------------------
+// Telegram send (unchanged behavior from the previous version)
+// ---------------------------------------------------------------------------
 
 async function sendTelegramMessage(env, text) {
-  const isDryRun = String(env.DRY_RUN || "true").toLowerCase() === "true";
+  const isDryRun = String(env.DRY_RUN ?? "true").toLowerCase() === "true";
   if (isDryRun) {
     console.log("[DRY RUN] Would send Telegram message:\n" + text);
     return { ok: true, dryRun: true };
@@ -639,6 +666,7 @@ async function sendTelegramMessage(env, text) {
       chat_id: env.TELEGRAM_CHANNEL_ID,
       text,
       parse_mode: "Markdown",
+      disable_web_page_preview: false,
     }),
   });
   const json = await res.json();
@@ -648,191 +676,78 @@ async function sendTelegramMessage(env, text) {
   return json;
 }
 
-function parseStoredBlock(value) {
-  if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
-  const block = Number(value);
-  return Number.isSafeInteger(block) ? block : null;
-}
+// ---------------------------------------------------------------------------
+// Orchestration
+// ---------------------------------------------------------------------------
 
-// Builds "PairCreated(address,address,address,uint256)" from the parsed event
-function formatEventSignature(event) {
-  const types = event.inputs.map((i) => i.type).join(",");
-  return `${event.name}(${types})`;
-}
+async function dispatchAlerts(env, alerts) {
+  for (const alert of alerts) {
+    const pairAddress = alert.pair.pairAddress;
+    const cooldownKind = cooldownKindFor(alert.kind);
 
-// Ask for logs matching ANY of our 3 events, from ANY of our 3 contracts, in one call
-async function getAllPoolLogs(fromBlock, toBlock, rpcUrl) {
-  const v2Topic = keccak256(toHex(formatEventSignature(V2_PAIR_CREATED)));
-  const v3Topic = keccak256(toHex(formatEventSignature(V3_POOL_CREATED)));
-  const v4Topic = keccak256(toHex(formatEventSignature(V4_INITIALIZE)));
+    if (cooldownKind && (await isOnCooldown(env, cooldownKind, pairAddress))) {
+      console.log(`Skipping ${alert.kind} for ${pairAddress}: on cooldown`);
+      continue;
+    }
 
-  return rpcCall(
-    "eth_getLogs",
-    [
-      {
-        address: [UNISWAP_V2_FACTORY, UNISWAP_V3_FACTORY, UNISWAP_V4_POOL_MANAGER],
-        fromBlock: toHex(fromBlock),
-        toBlock: toHex(toBlock),
-        topics: [[v2Topic, v3Topic, v4Topic]], // OR: match any of these three topics
-      },
-    ],
-    rpcUrl
-  );
-}
+    if (!(await isUnderHourlyCap(env))) {
+      console.log(`Hourly alert cap reached, skipping ${alert.kind} for ${pairAddress}`);
+      continue;
+    }
 
-async function checkForNewPools(env, fromBlock, toBlock, rpcUrl) {
-  const findings = [];
-  let lastCompletedBlock = fromBlock - 1;
-
-  for (let chunkStart = fromBlock; chunkStart <= toBlock; chunkStart += MAX_LOG_BLOCK_RANGE) {
-    const chunkEnd = Math.min(chunkStart + MAX_LOG_BLOCK_RANGE - 1, toBlock);
-    let logs;
     try {
-      logs = await getAllPoolLogs(chunkStart, chunkEnd, rpcUrl);
-
-      for (const log of logs) {
-        const address = log.address.toLowerCase();
-        let finding = null;
-        try {
-          if (address === UNISWAP_V2_FACTORY.toLowerCase()) {
-            const decoded = decodeEventLog({ abi: [V2_PAIR_CREATED], data: log.data, topics: log.topics });
-            finding = { source: "Uniswap V2", type: "NEW_PAIR", ...decoded.args, txHash: log.transactionHash };
-          } else if (address === UNISWAP_V3_FACTORY.toLowerCase()) {
-            const decoded = decodeEventLog({ abi: [V3_POOL_CREATED], data: log.data, topics: log.topics });
-            finding = { source: "Uniswap V3", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash };
-          } else if (address === UNISWAP_V4_POOL_MANAGER.toLowerCase()) {
-            const decoded = decodeEventLog({ abi: [V4_INITIALIZE], data: log.data, topics: log.topics });
-            finding = { source: "Uniswap V4", type: "NEW_POOL", ...decoded.args, txHash: log.transactionHash };
-          }
-        } catch (err) {
-          console.error("Could not decode a log, skipping it:", err.message);
-          continue;
-        }
-        if (!finding) continue;
-
-        let liquidity;
-        try {
-          liquidity = await getPoolLiquidity(finding, rpcUrl, env);
-        } catch (err) {
-          if (err.message === "SUBREQUEST_BUDGET_REACHED") throw err;
-          console.error("Liquidity read failed for", finding.txHash, err.message);
-          liquidity = { pairedWithWeth: null, usd: null, note: `Liquidity read error: ${err.message}` };
-        }
-
-        const filterResult = passesFilter(finding, liquidity);
-        const signal = computeSignalScore(finding, liquidity);
-        if (liquidity.zeroLiquidity) await rememberPendingPool(env, finding);
-        findings.push({
-          ...finding,
-          alertKind: liquidity.zeroLiquidity ? "ZERO_LIQUIDITY_LAUNCH" : undefined,
-          liquidity,
-          filterResult,
-          signal,
-        });
-      }
-      lastCompletedBlock = chunkEnd;
+      const result = await sendTelegramMessage(env, formatAlertMessage(alert));
+      if (result.dryRun) continue;
+      if (cooldownKind) await startCooldown(env, cooldownKind, pairAddress, CONFIG.COOLDOWN_MINUTES[cooldownKind]);
+      await incrementHourlyCap(env);
     } catch (err) {
-      if (err.message === "SUBREQUEST_BUDGET_REACHED") {
-        console.log(`Subrequest budget reached at block ${chunkStart}. Will resume from ${lastCompletedBlock + 1} next run.`);
-        break;
-      }
-      throw err;
+      if (err.message === "SUBREQUEST_BUDGET_REACHED") break;
+      console.error(`Failed to send ${alert.kind} alert for ${pairAddress}:`, err.message);
     }
   }
-
-  return { findings, lastCompletedBlock };
 }
 
 export default {
   async scheduled(event, env, ctx) {
     subrequestCount = 0;
     subrequestReserve = 0;
-    ethPricePromise = null;
-    preferredRpcUrl = env.RPC_URL || RPC_URL;
-    const rpcUrl = env.RPC_URL || RPC_URL;
-
-    let currentBlock;
-    try {
-      currentBlock = await getCurrentBlock(rpcUrl);
-    } catch (err) {
-      console.error("Could not fetch current block, skipping this run:", err.message);
-      return; // don't touch KV — just wait for the next scheduled run
-    }
-
-    const lastStr = await env.BOT_STATE.get("lastSeenBlock");
-    const lastBlock = parseStoredBlock(lastStr) ?? currentBlock - 1;
-
-    if (currentBlock <= lastBlock) {
-      console.log("No new blocks yet.");
-      return;
-    }
+    const polledAt = Date.now();
 
     try {
+      const newPairAlerts = await discoverNewPairs(env, polledAt);
+      const boostAlerts = await discoverBoosts(env, polledAt);
+
       subrequestReserve = ALERT_SUBREQUEST_RESERVE;
-      let scan;
+      let watchAlerts = [];
       try {
-        const pendingFindings = await checkPendingPools(env, rpcUrl);
-        scan = await checkForNewPools(env, lastBlock + 1, currentBlock, rpcUrl);
-        scan.findings.unshift(...pendingFindings);
+        watchAlerts = await pollWatchlist(env, polledAt);
       } finally {
         subrequestReserve = 0;
       }
-      const findings = scan.findings;
-      for (const finding of findings) {
-        if (finding.alertKind === "ZERO_LIQUIDITY_LAUNCH") {
-          finding.filterResult = { passes: true, reason: "New pool detected before liquidity was added" };
-        }
+
+      const allAlerts = [...newPairAlerts, ...boostAlerts, ...watchAlerts];
+      console.log(`Polled Robinhood Chain via DexScreener. ${allAlerts.length} alert(s) generated.`);
+
+      subrequestReserve = ALERT_SUBREQUEST_RESERVE;
+      try {
+        await dispatchAlerts(env, allAlerts);
+      } finally {
+        subrequestReserve = 0;
       }
-      console.log(`Checked blocks ${lastBlock + 1} to ${currentBlock}. Found ${findings.length} new pool(s).`);
-      for (const f of findings) {
-        const status = f.filterResult.passes ? "ALERT-WORTHY" : "filtered";
-        const alertKind = f.alertKind ? ` | ${f.alertKind}` : "";
-        console.log(
-          `${status}${alertKind} | ${f.source} ${f.type} | Signal ${f.signal.score}/${f.signal.maxPossibleRightNow} | ${f.filterResult.reason}`
-        );
-
-        if (!f.filterResult.passes) continue;
-
-        if (await isDuplicate(env, f)) {
-          console.log(`Skipping duplicate alert for ${f.txHash}`);
-          continue;
-        }
-
-        const tokenAddress = getNonWethTokenAddress(f);
-        if (f.alertKind !== "LIQUIDITY_ADDED" && (await isOnCooldown(env, tokenAddress))) {
-          console.log(`Token ${tokenAddress} is on cooldown, skipping`);
-          continue;
-        }
-
-        if (!(await isUnderHourlyCap(env))) {
-          console.log(`Hourly alert cap reached, skipping ${f.txHash}`);
-          continue;
-        }
-
-        try {
-          const result = await sendTelegramMessage(env, formatAlertMessage(f));
-          if (result.dryRun) continue;
-
-          await markAlerted(env, f);
-          await startCooldown(env, tokenAddress);
-          await incrementHourlyCap(env);
-        } catch (err) {
-          console.error(`Failed to send alert for ${f.txHash}, will retry next cycle:`, err.message);
-        }
-      }
-      await env.BOT_STATE.put("lastSeenBlock", scan.lastCompletedBlock.toString());
     } catch (err) {
-      console.error("Log scan failed, will retry next run:", err.message);
-      // Important: do NOT update lastSeenBlock here — so we retry this same range next time
+      if (err.message === "SUBREQUEST_BUDGET_REACHED") {
+        console.log("Subrequest budget reached this run; remaining work resumes next cycle.");
+        return;
+      }
+      console.error("Scheduled run failed:", err.message);
     }
   },
 
-  // Manual visits just report status — they do NOT trigger a real scan.
-  // (The Cron Trigger already runs scans every 3 minutes; we don't want
-  // every page load, favicon request, or bot crawler burning extra RPC calls.)
+  // Manual visits just report status — they do NOT trigger a real poll.
   async fetch(request, env, ctx) {
-    const last = await env.BOT_STATE.get("lastSeenBlock");
-    const lastBlock = parseStoredBlock(last);
-    return new Response(`Robinhood Detective is alive. Last checked block: ${lastBlock ?? "not yet available"}`);
+    const watchlist = await getWatchlist(env);
+    return new Response(
+      `Robinhood Detective is alive. Tracking ${watchlist.length} token(s) on Robinhood Chain via DexScreener.`
+    );
   },
 };
