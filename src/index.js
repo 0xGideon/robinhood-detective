@@ -17,6 +17,8 @@ const RPC_REQUEST_SPACING_MS = 150;
 const COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd";
 const GET_RESERVES_SELECTOR = "0x0902f1ac";
 const BALANCE_OF_SELECTOR = "0x70a08231";
+const DECIMALS_SELECTOR = "0x313ce567";
+const Q96 = 2n ** 96n;
 const POOLS_SLOT = 6n;
 const LIQUIDITY_OFFSET = 3n;
 const EXTSLOAD_SELECTOR = toFunctionSelector("extsload(bytes32)");
@@ -26,7 +28,6 @@ let cachedEthPriceTime = 0;
 let ethPricePromise = null;
 let subrequestCount = 0;
 let subrequestReserve = 0;
-let v4LiquidityDiagnosticLogged = false;
 let preferredRpcUrl = RPC_URL;
 
 // ---- Configurable settings (from the original spec) ----
@@ -202,6 +203,31 @@ async function ethCall(to, data, rpcUrl) {
   return rpcCall("eth_call", [{ to, data }, "latest"], rpcUrl);
 }
 
+async function getTokenDecimalsOrDefault(tokenAddress, rpcUrl, fallback = 18) {
+  try {
+    const raw = await ethCall(tokenAddress, DECIMALS_SELECTOR, rpcUrl);
+    if (typeof raw === "string" && /^0x[0-9a-f]+$/i.test(raw)) {
+      const decimals = Number(BigInt(raw));
+      if (Number.isInteger(decimals) && decimals >= 0 && decimals <= 36) return decimals;
+    }
+  } catch (err) {
+    console.error(`decimals() lookup failed for ${tokenAddress}, assuming ${fallback}:`, err.message);
+  }
+  return fallback;
+}
+
+async function getTokenBalance(tokenAddress, account, rpcUrl) {
+  const raw = await ethCall(
+    tokenAddress,
+    `${BALANCE_OF_SELECTOR}${encodeAddressParam(account)}`,
+    rpcUrl
+  );
+  if (typeof raw !== "string" || !/^0x[0-9a-f]+$/i.test(raw)) {
+    throw new Error(`Invalid balanceOf response for ${tokenAddress}`);
+  }
+  return BigInt(raw);
+}
+
 function getPoolStateSlot(poolId) {
   return keccak256(encodePacked(["bytes32", "uint256"], [poolId, POOLS_SLOT]));
 }
@@ -234,7 +260,14 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
     const token1IsWeth = finding.token1.toLowerCase() === WETH_ADDRESS.toLowerCase();
 
     if (!token0IsWeth && !token1IsWeth) {
-      return { pairedWithWeth: false, note: "Non-WETH pair - token amounts only, no USD figure" };
+      const decimals0 = await getTokenDecimalsOrDefault(finding.token0, rpcUrl);
+      const decimals1 = await getTokenDecimalsOrDefault(finding.token1, rpcUrl);
+      return {
+        pairedWithWeth: false,
+        token0Amount: Number(reserve0) / 10 ** decimals0,
+        token1Amount: Number(reserve1) / 10 ** decimals1,
+        note: "Non-WETH pair - token amounts shown, no USD figure",
+      };
     }
 
     const ethPrice = await getEthUsdPriceOrNull(env);
@@ -252,20 +285,24 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
     const token1IsWeth = finding.token1.toLowerCase() === WETH_ADDRESS.toLowerCase();
 
     if (!token0IsWeth && !token1IsWeth) {
-      return { pairedWithWeth: false, note: "Non-WETH pair - token amounts only, no USD figure" };
+      const [balance0, balance1] = await Promise.all([
+        getTokenBalance(finding.token0, finding.pool, rpcUrl),
+        getTokenBalance(finding.token1, finding.pool, rpcUrl),
+      ]);
+      const [decimals0, decimals1] = await Promise.all([
+        getTokenDecimalsOrDefault(finding.token0, rpcUrl),
+        getTokenDecimalsOrDefault(finding.token1, rpcUrl),
+      ]);
+      return {
+        pairedWithWeth: false,
+        token0Amount: Number(balance0) / 10 ** decimals0,
+        token1Amount: Number(balance1) / 10 ** decimals1,
+        note: "Non-WETH pair - token amounts shown, no USD figure",
+      };
     }
 
     const ethPrice = await getEthUsdPriceOrNull(env);
-    const raw = await ethCall(
-      WETH_ADDRESS,
-      `${BALANCE_OF_SELECTOR}${encodeAddressParam(finding.pool)}`,
-      rpcUrl
-    );
-    if (typeof raw !== "string" || !/^0x[0-9a-f]+$/i.test(raw)) {
-      throw new Error("Invalid WETH balance response");
-    }
-
-    const wethAmount = Number(BigInt(raw)) / 1e18;
+    const wethAmount = Number(await getTokenBalance(WETH_ADDRESS, finding.pool, rpcUrl)) / 1e18;
     return {
       pairedWithWeth: true,
       wethAmount,
@@ -274,25 +311,59 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
     };
   }
 
-  if (!v4LiquidityDiagnosticLogged) {
-    v4LiquidityDiagnosticLogged = true;
-    const poolId = finding.id;
-    console.log(
-      `V4 diagnostic debug | pool ${poolId} | currency0 ${finding.currency0} | currency1 ${finding.currency1} | sqrtPriceX96 ${finding.sqrtPriceX96}`
-    );
-    if (typeof poolId === "string" && /^0x[0-9a-f]{64}$/i.test(poolId)) {
-      try {
-        const liquidity = await getV4Liquidity(poolId, rpcUrl);
-        console.log(`V4 liquidity diagnostic | pool ${poolId} | raw liquidity ${liquidity}`);
-      } catch (err) {
-        console.error(`V4 liquidity diagnostic failed | pool ${poolId}:`, err.message);
-      }
-    } else {
-      console.log("V4 diagnostic skipped: id did not match expected bytes32 shape");
-    }
+  const poolId = finding.id;
+  if (typeof poolId !== "string" || !/^0x[0-9a-f]{64}$/i.test(poolId)) {
+    return { pairedWithWeth: null, note: "N/A - invalid V4 pool id" };
   }
 
-  return { pairedWithWeth: null, note: "N/A - V4 per-pool liquidity math not yet implemented" };
+  let liquidity;
+  try {
+    liquidity = await getV4Liquidity(poolId, rpcUrl);
+  } catch (err) {
+    return { pairedWithWeth: null, note: `N/A - V4 liquidity read failed: ${err.message}` };
+  }
+
+  const sqrtPriceX96 = BigInt(finding.sqrtPriceX96);
+  const currency0 = finding.currency0;
+  const currency1 = finding.currency1;
+  const token0IsWeth = currency0.toLowerCase() === WETH_ADDRESS.toLowerCase();
+  const token1IsWeth = currency1.toLowerCase() === WETH_ADDRESS.toLowerCase();
+
+  if (liquidity === 0n || sqrtPriceX96 === 0n) {
+    return {
+      pairedWithWeth: token0IsWeth || token1IsWeth,
+      usd: token0IsWeth || token1IsWeth ? 0 : null,
+      note: "V4 pool not yet funded (zero liquidity)",
+    };
+  }
+
+  const virtualReserve0 = (liquidity * Q96) / sqrtPriceX96;
+  const virtualReserve1 = (liquidity * sqrtPriceX96) / Q96;
+
+  if (!token0IsWeth && !token1IsWeth) {
+    const [decimals0, decimals1] = await Promise.all([
+      getTokenDecimalsOrDefault(currency0, rpcUrl),
+      getTokenDecimalsOrDefault(currency1, rpcUrl),
+    ]);
+    return {
+      pairedWithWeth: false,
+      estimated: true,
+      token0Amount: Number(virtualReserve0) / 10 ** decimals0,
+      token1Amount: Number(virtualReserve1) / 10 ** decimals1,
+      note: "Non-WETH V4 pair - estimated token amounts, no USD figure",
+    };
+  }
+
+  const wethRaw = token0IsWeth ? virtualReserve0 : virtualReserve1;
+  const wethAmount = Number(wethRaw) / 1e18;
+  const ethPrice = await getEthUsdPriceOrNull(env);
+  return {
+    pairedWithWeth: true,
+    estimated: true,
+    wethAmount,
+    usd: ethPrice === null ? null : wethAmount * ethPrice,
+    note: ethPrice === null ? "WETH price unavailable this run" : "Estimated from active-tick liquidity (V4)",
+  };
 }
 
 function computeSignalScore(finding, liquidity) {
@@ -370,11 +441,11 @@ function formatAlertMessage(finding) {
   const liquidity = finding.liquidity;
   const liquidityLine =
     liquidity.pairedWithWeth === true && liquidity.usd !== null
-      ? `Liquidity: $${liquidity.usd.toLocaleString(undefined, { maximumFractionDigits: 0 })}`
+      ? `Liquidity: $${liquidity.usd.toLocaleString(undefined, { maximumFractionDigits: 0 })}${liquidity.estimated ? " (estimated)" : ""}`
       : liquidity.pairedWithWeth === true
       ? `Liquidity: ${liquidity.wethAmount.toFixed(3)} WETH (USD price unavailable)`
       : liquidity.pairedWithWeth === false
-      ? "Liquidity: non-WETH pair - token amounts only"
+      ? `Liquidity: ${liquidity.token0Amount?.toLocaleString(undefined, { maximumFractionDigits: 2 })} / ${liquidity.token1Amount?.toLocaleString(undefined, { maximumFractionDigits: 2 })} (non-WETH pair, no USD)`
       : `Liquidity: N/A (${liquidity.note})`;
 
   return [
@@ -516,7 +587,6 @@ export default {
   async scheduled(event, env, ctx) {
     subrequestCount = 0;
     subrequestReserve = 0;
-    v4LiquidityDiagnosticLogged = false;
     ethPricePromise = null;
     preferredRpcUrl = env.RPC_URL || RPC_URL;
     const rpcUrl = env.RPC_URL || RPC_URL;
