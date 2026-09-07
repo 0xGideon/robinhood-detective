@@ -277,7 +277,9 @@ async function getPoolLiquidity(finding, rpcUrl, env) {
   if (!v4LiquidityDiagnosticLogged) {
     v4LiquidityDiagnosticLogged = true;
     const poolId = finding.id;
-    console.log(`V4 diagnostic debug | typeof id: ${typeof poolId} | value: ${String(poolId)}`);
+    console.log(
+      `V4 diagnostic debug | pool ${poolId} | currency0 ${finding.currency0} | currency1 ${finding.currency1} | sqrtPriceX96 ${finding.sqrtPriceX96}`
+    );
     if (typeof poolId === "string" && /^0x[0-9a-f]{64}$/i.test(poolId)) {
       try {
         const liquidity = await getV4Liquidity(poolId, rpcUrl);
