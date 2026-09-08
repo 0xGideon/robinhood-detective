@@ -640,12 +640,25 @@ function evaluatePair(pair, prevState, polledAt) {
     }
   }
 
-  // --- Feature 3: Volume surge ---
+  // --- Feature 3: Volume surge (demand-driven only) ---
+  // A surge should reflect real demand, not a sell-off. So we only alert when the
+  // volume spike is accompanied by a positive 5-min price change AND net buys
+  // (buys >= sells). Sell-heavy volume spikes (e.g. a fast dump) stay silent.
   if (prevState && prevState.volumeHistory && prevState.volumeHistory.length >= 2) {
     const baseline =
       prevState.volumeHistory.reduce((a, b) => a + b, 0) / prevState.volumeHistory.length;
     const volumeM5 = pair.volume?.m5 ?? 0;
-    if (baseline > 0 && volumeM5 >= baseline * CONFIG.THRESHOLDS.VOLUME_MULTIPLIER && volumeM5 >= CONFIG.THRESHOLDS.VOLUME_MIN_USD) {
+    const buys = pair.txns?.m5?.buys ?? 0;
+    const sells = pair.txns?.m5?.sells ?? 0;
+    const priceChange5m = pair.priceChange?.m5;
+    const demandConfirmed =
+      typeof priceChange5m === "number" && priceChange5m > 0 && buys >= sells;
+    if (
+      baseline > 0 &&
+      volumeM5 >= baseline * CONFIG.THRESHOLDS.VOLUME_MULTIPLIER &&
+      volumeM5 >= CONFIG.THRESHOLDS.VOLUME_MIN_USD &&
+      demandConfirmed
+    ) {
       alerts.push({
         kind: "VOLUME_SURGE",
         pair,
