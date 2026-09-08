@@ -36,6 +36,93 @@ The bot evaluates each discovered pair every polling cycle and can report:
 
 Alerts use cooldowns by pair and alert category. A global hourly cap also prevents excessive Telegram traffic.
 
+## Alert Emojis
+
+Certain alerts get an extra emoji when they cross a "high severity" threshold, so they're easy to spot at a glance in a busy channel:
+
+| Condition | Emoji | Trigger |
+| --- | --- | --- |
+| Extreme price move | 🚨 | Price move ≥ 100% in the alert window |
+| Normal price move | 🚀 / 📉 | Below the 100% extreme threshold |
+| Extreme buy/sell imbalance | 🔥⚖️ | Buy:sell (or sell:buy) ratio ≥ 25:1 |
+| Normal imbalance | ⚖️ | Ratio between 10:1 and 25:1 |
+| Massive volume surge | ⚡📈 | Volume ≥ 10x trailing average |
+| Normal volume surge | 📈 | Volume between 3x and 10x trailing average |
+
+### Sample Alerts
+
+**Extreme price pump (🚨):**
+
+🚨 EXTREME PUMP — PLTR/WETH
+
++142% in 5 min
+Current price: $0.0842
+
+📊 https://dexscreener.com/robinhood/0xabc...
+⏱ data as of 12s ago
+🕵️‍♂️ Robinhood Detective
+
+
+**Normal price pump (🚀):**
+
+🚀 PRICE PUMP — TSLA/WETH
+
++31% in 5 min
+Current price: $1.2043
+
+📊 https://dexscreener.com/robinhood/0xdef...
+⏱ data as of 8s ago
+🕵️‍♂️ Robinhood Detective
+
+
+**Extreme buy imbalance (🔥⚖️):**
+
+🔥⚖️ EXTREME BUY IMBALANCE — COIN/WETH
+
+184 buys vs 6 sells (5min, ~31:1)
+Heavy one-sided flow — early momentum or wash pattern
+
+📊 https://dexscreener.com/robinhood/0xghi...
+⏱ data as of 15s ago
+🕵️‍♂️ Robinhood Detective
+
+
+**Extreme sell imbalance (🔥⚖️):**
+
+🔥⚖️ EXTREME SELL IMBALANCE — GME/WETH
+
+4 buys vs 121 sells (5min, ~30:1)
+Heavy one-sided flow — possible exit pressure
+
+📊 https://dexscreener.com/robinhood/0xmno...
+⏱ data as of 18s ago
+🕵️‍♂️ Robinhood Detective
+
+
+**Massive volume surge (⚡📈):**
+
+⚡📈 MASSIVE VOLUME SURGE — NVDA/WETH
+
+5min volume: $48,200 (12.3x trailing avg)
+Buys: 96 · Sells: 41
+
+📊 https://dexscreener.com/robinhood/0xjkl...
+⏱ data as of 20s ago
+🕵️‍♂️ Robinhood Detective
+
+
+**Normal volume surge (📈):**
+
+📈 VOLUME SURGE — SOFI/WETH
+
+5min volume: $6,400 (4.1x trailing avg)
+Buys: 22 · Sells: 15
+
+📊 https://dexscreener.com/robinhood/0xpqr...
+⏱ data as of 11s ago
+🕵️‍♂️ Robinhood Detective
+
+
 ## Current Thresholds
 
 Important defaults in `src/index.js` include:
@@ -46,9 +133,12 @@ Important defaults in `src/index.js` include:
 | Maximum alerts per hour | 40 |
 | Liquidity change threshold | 0.3% and at least $2,500 |
 | Volume surge threshold | 3x trailing average and at least $250 |
+| Massive volume surge (⚡) threshold | 10x trailing average |
 | 5-minute price threshold | 25% |
 | 1-hour price threshold | 60% |
+| Extreme price move (🚨) threshold | 100% |
 | Imbalance threshold | 10:1 with at least 10 transactions |
+| Extreme imbalance (🔥) threshold | 25:1 |
 | Poll schedule | Every 3 minutes |
 
 The bot also tracks FDV tiers from $50,000 through $10,000,000 and maintains a short rolling volume history for each pair.

@@ -233,6 +233,9 @@ const CONFIG = {
     PRICE_PCT_1H: 60,
     IMBALANCE_RATIO: 10, // 10:1
     IMBALANCE_MIN_TXNS: 10,
+    EXTREME_PRICE_PCT: 100,       // 🚨 threshold for siren-level price moves
+    HIGH_IMBALANCE_RATIO: 25,     // 🔥 threshold for extreme buy/sell imbalance
+    HIGH_VOLUME_MULTIPLIER: 10,   // ⚡ threshold for massive volume surges
     FDV_TIERS: [50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000, 10_000_000],
     DEAD_LIQUIDITY_MIN_PEAK_TO_TRACK: 500, // only track "peak" once a pool had real liquidity
     DEAD_LIQUIDITY_PCT_OF_PEAK: 0.1, // below 10% of peak
@@ -755,8 +758,11 @@ function formatAlertMessage(alert) {
     case "VOLUME_SURGE": {
       const buys = pair.txns?.m5?.buys ?? 0;
       const sells = pair.txns?.m5?.sells ?? 0;
+      const isHigh = alert.multiplier >= CONFIG.THRESHOLDS.HIGH_VOLUME_MULTIPLIER;
+      const emoji = isHigh ? "⚡📈" : "📈";
+      const label = isHigh ? "MASSIVE VOLUME SURGE" : "VOLUME SURGE";
       return [
-        `📈 VOLUME SURGE — ${pairLabel}`,
+        `${emoji} ${label} — ${pairLabel}`,
         "",
         `5min volume: ${fmtUsd(pair.volume?.m5)} (${alert.multiplier.toFixed(1)}x trailing avg)`,
         `Buys: ${buys} · Sells: ${sells}`,
@@ -770,8 +776,13 @@ function formatAlertMessage(alert) {
     case "PRICE_PUMP":
     case "PRICE_DUMP": {
       const isPump = kind === "PRICE_PUMP";
+      const isExtreme = Math.abs(alert.pct) >= CONFIG.THRESHOLDS.EXTREME_PRICE_PCT;
+      const emoji = isExtreme ? "🚨" : isPump ? "🚀" : "📉";
+      const label = isExtreme
+        ? isPump ? "EXTREME PUMP" : "EXTREME DUMP"
+        : isPump ? "PRICE PUMP" : "PRICE DUMP";
       return [
-        `${isPump ? "🚀 PRICE PUMP" : "📉 PRICE DUMP"} — ${pairLabel}`,
+        `${emoji} ${label} — ${pairLabel}`,
         "",
         `${isPump ? "+" : ""}${alert.pct.toFixed(0)}% in ${alert.window}`,
         `Current price: ${fmtPrice(pair.priceUsd ? Number(pair.priceUsd) : null)}`,
@@ -785,10 +796,18 @@ function formatAlertMessage(alert) {
     case "IMBALANCE_BUY":
     case "IMBALANCE_SELL": {
       const isBuy = kind === "IMBALANCE_BUY";
+      const ratio = isBuy
+        ? alert.sells > 0 ? alert.buys / alert.sells : alert.buys
+        : alert.buys > 0 ? alert.sells / alert.buys : alert.sells;
+      const isHigh = ratio >= CONFIG.THRESHOLDS.HIGH_IMBALANCE_RATIO;
+      const emoji = isHigh ? "🔥⚖️" : "⚖️";
+      const label = isHigh
+        ? isBuy ? "EXTREME BUY IMBALANCE" : "EXTREME SELL IMBALANCE"
+        : isBuy ? "BUY IMBALANCE" : "SELL IMBALANCE";
       return [
-        `⚖️ ${isBuy ? "BUY" : "SELL"} IMBALANCE — ${pairLabel}`,
+        `${emoji} ${label} — ${pairLabel}`,
         "",
-        `${alert.buys} buys vs ${alert.sells} sells (5min)`,
+        `${alert.buys} buys vs ${alert.sells} sells (5min, ~${ratio.toFixed(0)}:1)`,
         `Heavy one-sided flow — ${isBuy ? "early momentum or wash pattern" : "possible exit pressure"}`,
         "",
         `📊 ${pair.url}`,
