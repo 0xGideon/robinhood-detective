@@ -256,11 +256,30 @@ let subrequestCount = 0;
 let subrequestReserve = 0;
 
 // ---------------------------------------------------------------------------
+// Health / watchdog
+// ---------------------------------------------------------------------------
+// Every completed scheduled run writes a heartbeat into KV. The /health and
+// /watchdog endpoints read it back so an external pinger (GitHub Actions cron,
+// UptimeRobot, etc.) can detect when scheduled runs stop completing and alert.
+const WORKER_NAME = "Robinhood Detective";
+const RUN_HEALTH_KEY = "health:lastRun";
+const WATCHDOG_STATE_KEY = "health:watchdog";
+const WATCHDOG_STALE_MS = 10 * 60 * 1000; // cron is */3 min -> ~3 missed completions
+const WATCHDOG_REALERT_MS = 45 * 60 * 1000; // don't re-notify "down" more than once / 45 min
+
+// ---------------------------------------------------------------------------
 // Low-level helpers
 // ---------------------------------------------------------------------------
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8" },
+  });
 }
 
 function trackSubrequest() {
@@ -478,6 +497,42 @@ async function incrementHourlyCap(env) {
   const count = countStr ? Number.parseInt(countStr, 10) : 0;
   const next = Number.isSafeInteger(count) && count >= 0 ? count + 1 : 1;
   await env.BOT_STATE.put("hourlyAlertCount", next.toString(), { expirationTtl: 60 * 60 });
+}
+
+async function recordRunHealth(env, { ok, alerts, error }) {
+  const payload = {
+    at: Date.now(),
+    ok: Boolean(ok),
+    alerts: Number.isFinite(alerts) ? alerts : 0,
+    error: error ? String(error).slice(0, 500) : null,
+  };
+  await env.BOT_STATE.put(RUN_HEALTH_KEY, JSON.stringify(payload), { expirationTtl: 7 * 24 * 60 * 60 });
+}
+
+async function readRunHealth(env) {
+  const raw = await env.BOT_STATE.get(RUN_HEALTH_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed.at === "number" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readWatchdogState(env) {
+  const raw = await env.BOT_STATE.get(WATCHDOG_STATE_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed.state === "string" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeWatchdogState(env, state) {
+  await env.BOT_STATE.put(WATCHDOG_STATE_KEY, JSON.stringify(state), { expirationTtl: 7 * 24 * 60 * 60 });
 }
 
 // ---------------------------------------------------------------------------
@@ -956,6 +1011,50 @@ async function dispatchAlerts(env, alerts) {
   }
 }
 
+// Called by an external pinger hitting /watchdog (e.g. GitHub Actions cron or an
+// uptime monitor). Alerts Telegram if no scheduled run has completed recently.
+async function runWatchdog(env) {
+  const now = Date.now();
+  const lastRun = await readRunHealth(env);
+  const state = (await readWatchdogState(env)) || { state: "up", lastAlertAt: 0 };
+
+  if (!lastRun) {
+    // No heartbeat recorded yet (fresh deploy of this feature). Not an outage —
+    // wait for the first completed scheduled run to establish a baseline.
+    return { healthy: null, initialized: false };
+  }
+
+  const ageMs = Math.max(0, now - lastRun.at);
+
+  if (ageMs > WATCHDOG_STALE_MS) {
+    const alreadyDown = state.state === "down";
+    const renotify = now - state.lastAlertAt > WATCHDOG_REALERT_MS;
+    if (!alreadyDown || renotify) {
+      await sendTelegramMessage(
+        env,
+        [
+          "🚨 BOT HEARTBEAT MISSED",
+          "",
+          `${WORKER_NAME} has not completed a scheduled run for ~${Math.round(ageMs / 60000)} min.`,
+          "Scheduled cron: every 3 minutes.",
+          `Last completed run: ${new Date(lastRun.at).toISOString()} (${lastRun.ok ? "ok" : `error: ${lastRun.error ?? "unknown"}`})`,
+          "",
+          SHORT_FOOTER,
+        ].join("\n")
+      );
+      await writeWatchdogState(env, { state: "down", lastAlertAt: now });
+    }
+    return { healthy: false, ageSec: Math.round(ageMs / 1000), alerted: true };
+  }
+
+  if (state.state === "down") {
+    await sendTelegramMessage(env, `✅ ${WORKER_NAME} is completing scheduled runs normally again.`);
+    await writeWatchdogState(env, { state: "up", lastAlertAt: now });
+  }
+
+  return { healthy: true, ageSec: Math.round(ageMs / 1000), alerted: false, lastRun };
+}
+
 export default {
   async scheduled(event, env, ctx) {
     subrequestCount = 0;
@@ -982,17 +1081,43 @@ export default {
       } finally {
         subrequestReserve = 0;
       }
+
+      // Heartbeat: a completed run (even with 0 alerts) proves the worker is alive.
+      await recordRunHealth(env, { ok: true, alerts: allAlerts.length });
     } catch (err) {
       if (err.message === "SUBREQUEST_BUDGET_REACHED") {
         console.log("Subrequest budget reached this run; remaining work resumes next cycle.");
+        await recordRunHealth(env, { ok: true, alerts: 0, error: err.message });
         return;
       }
       console.error("Scheduled run failed:", err.message);
+      await recordRunHealth(env, { ok: false, alerts: 0, error: err.message });
     }
   },
 
   // Manual visits just report status — they do NOT trigger a real poll.
+  //   /health      -> JSON with last-run heartbeat + staleness
+  //   /watchdog    -> external health check: alerts Telegram if runs have stopped
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname === "/watchdog" || url.searchParams.get("watchdog") === "1") {
+      try {
+        return jsonResponse({ ok: true, service: WORKER_NAME, ...(await runWatchdog(env)) });
+      } catch (err) {
+        return jsonResponse({ ok: false, error: String(err.message ?? err) }, 500);
+      }
+    }
+    if (url.pathname === "/health") {
+      const lastRun = await readRunHealth(env);
+      const ageSec = lastRun ? Math.round((Date.now() - lastRun.at) / 1000) : null;
+      return jsonResponse({
+        service: WORKER_NAME,
+        status: "ok",
+        lastRun,
+        ageSec,
+        stale: lastRun ? ageSec > WATCHDOG_STALE_MS / 1000 : true,
+      });
+    }
     return new Response("Robinhood Detective is alive, tracking Robinhood Chain via DexScreener.");
   },
 };

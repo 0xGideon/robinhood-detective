@@ -1,0 +1,24 @@
+name: Worker Watchdog
+
+# Pings the worker's /watchdog endpoint every 5 minutes. The worker itself
+# tracks a heartbeat written by each scheduled run and posts a Telegram alert
+# ("BOT HEARTBEAT MISSED") if runs stop completing. This workflow is the
+# out-of-band caller so that even a silently-crashing cron handler gets caught
+# within ~10 minutes instead of going unnoticed.
+#
+# If the worker endpoint is completely unreachable, this job fails and GitHub
+# sends a failure notification to the repo.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping worker watchdog
+        run: |
+          curl -fsS --max-time 30 \
+            "https://robinhood-detective.gideonholmesjn.workers.dev/watchdog" || exit 1
