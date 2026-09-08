@@ -883,30 +883,43 @@ async function sendTelegramMessage(env, text) {
     throw new Error("Telegram secrets are not configured");
   }
 
-  trackSubrequest();
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: env.TELEGRAM_CHANNEL_ID,
-      text,
-      parse_mode: "Markdown",
-      disable_web_page_preview: true,
-    }),
-  });
-  const json = await res.json();
-  if (!res.ok || !json.ok) {
+  const payload = {
+    chat_id: env.TELEGRAM_CHANNEL_ID,
+    text,
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+  };
+
+  // Telegram throttles bursts with HTTP 429 + retry_after. Wait and retry once so
+  // alerts raised in the same run still get delivered instead of being dropped.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    trackSubrequest();
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (res.ok && json.ok) return json;
+
+    const retryAfter = json?.parameters?.retry_after;
+    if (res.status === 429 && typeof retryAfter === "number" && attempt < 2) {
+      await sleep(Math.min(retryAfter * 1000, 8000));
+      continue;
+    }
     throw new Error(`Telegram send failed: ${JSON.stringify(json)}`);
   }
-  return json;
 }
 
 // ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
 
+const TELEGRAM_SEND_INTERVAL_MS = 1200; // Telegram same-chat limit is ~1 msg/sec
+
 async function dispatchAlerts(env, alerts) {
+  let lastSendAt = 0;
   for (const alert of alerts) {
     if (isIgnoredPair(alert.pair)) {
       console.log(`Skipping ${alert.kind} for ignored pair ${alert.pair.pairAddress}`);
@@ -927,6 +940,11 @@ async function dispatchAlerts(env, alerts) {
     }
 
     try {
+      const now = Date.now();
+      if (lastSendAt > 0 && now - lastSendAt < TELEGRAM_SEND_INTERVAL_MS) {
+        await sleep(TELEGRAM_SEND_INTERVAL_MS - (now - lastSendAt));
+      }
+      lastSendAt = Date.now();
       const result = await sendTelegramMessage(env, formatAlertMessage(alert));
       if (result.dryRun) continue;
       if (cooldownKind) await startCooldown(env, cooldownKind, pairAddress, CONFIG.COOLDOWN_MINUTES[cooldownKind]);
