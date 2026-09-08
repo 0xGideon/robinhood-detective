@@ -223,7 +223,7 @@ const MAX_SUBREQUESTS_PER_RUN = 45; // Cloudflare Workers subrequest ceiling hea
 const ALERT_SUBREQUEST_RESERVE = 5; // keep room for Telegram sends after data fetching
 
 const CONFIG = {
-  MAX_ALERTS_PER_HOUR: 150,
+  MAX_ALERTS_PER_HOUR: 250,
   THRESHOLDS: {
     LIQUIDITY_PCT: 0.3,
     LIQUIDITY_MIN_USD_MOVE: 2500,

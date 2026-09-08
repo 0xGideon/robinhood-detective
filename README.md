@@ -130,7 +130,7 @@ Important defaults in `src/index.js` include:
 | Setting | Value |
 | --- | ---: |
 | Minimum liquidity to track | $5,000 |
-| Maximum alerts per hour | 150 |
+| Maximum alerts per hour | 250 |
 | Liquidity change threshold | 0.3% and at least $2,500 |
 | Volume surge threshold | 3x trailing average and at least $250 |
 | Massive volume surge (⚡) threshold | 10x trailing average |
